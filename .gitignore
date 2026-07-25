@@ -1,4 +1,4 @@
-# Data and results — top-level only
+# Data and results — top-level only (must use leading / so src/argus/data/ is NOT blocked)
 /dataset/
 /results/
 /data/
