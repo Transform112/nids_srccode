@@ -1,0 +1,5 @@
+# Fallback head if the evidential head will not converge.
+model:
+  name: argus
+head:
+  type: distance_threshold

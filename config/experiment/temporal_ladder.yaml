@@ -1,0 +1,19 @@
+# Temporal ablation ladder (docs/09_TEMPORAL_STUDY.md §3, docs/13_EXPERIMENT_MATRIX.md E-TEMP-L0..L7).
+#
+# Consumed by scripts/10_run_temporal_ladder.py via --rungs/--seeds (this file
+# is a human-readable record of the full Kaggle-scale sweep spec; the runner
+# does not currently parse experiment YAMLs directly — pass the equivalent
+# --rungs/--seeds CLI flags to reproduce it).
+
+rungs: [L0, L1, L2, L3, L4, L5, L6, L7]
+seeds: [0, 1, 2, 3, 4]
+train:
+  stage1_epochs: 15
+  stage1_patience: 3
+
+# Reminders (docs/09_TEMPORAL_STUDY.md §3.4):
+# - Report per-class F1 deltas vs the previous rung, not just macro (figure F10).
+# - L0 -> L2 is the standalone, publishable "what is NF-v3's temporal signal
+#   worth to a graph model" finding -- report it even if nothing else lands.
+# - L6 is where the multi-scale gate-by-class figure (F5) comes from.
+# - Record which of the section-3.3 hypotheses were confirmed or refuted.

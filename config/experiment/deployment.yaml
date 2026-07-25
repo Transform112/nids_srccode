@@ -1,0 +1,22 @@
+# Deployment measurement (docs/08_EVALUATION.md §4.6, docs/13_EXPERIMENT_MATRIX.md E-DEP-1).
+#
+# Measured via StreamingDetector.push() — per-flow latency, throughput, memory.
+# Compare ARGUS vs E-GraphSAGE on identical hardware.
+#
+# The cost table is more credible than a claim of free improvement: if ARGUS is
+# slower, report honestly and price the temporal/robustness gain against it.
+
+data:
+  protocol: A
+
+run:
+  device: cuda
+  precision: bf16
+
+# Deployment measurement parameters
+deployment:
+  stream_duration_minutes: 10
+  warmup_minutes: 1
+  latency_percentiles: [50, 90, 95, 99]
+
+# Compare: ARGUS, ARGUS-mean-agg, E-GraphSAGE

@@ -1,0 +1,5 @@
+# Ablation: EPC removed; isolates C1.
+model:
+  name: argus
+head:
+  type: softmax

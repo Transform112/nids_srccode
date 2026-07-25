@@ -1,0 +1,20 @@
+# Host-disjoint split / identity-leakage audit (docs/02_DATASETS.md §7.1,
+# docs/08_EVALUATION.md Protocol D, docs/13_EXPERIMENT_MATRIX.md E-ID-*).
+#
+# Splits by source IP rather than time: train and test hosts are disjoint.
+# This measures how much performance relies on host identity rather than behaviour —
+# the identity-leakage floor (TRAP 3).
+#
+# If macro-F1 drops materially vs Protocol A, host memorisation is present.
+# The drop IS the finding — report it in the paper as the identity-reliance gap.
+
+data:
+  protocol: D
+
+train:
+  stage1_epochs: 30
+  stage2_epochs: 10
+  memory_dropout: 0.10  # anti-memorisation; sweep [0.0, 0.1, 0.2]
+
+# Report: identity floor, unseen-pair rate, per-class host concentration,
+# and the identity-reliance gap (Protocol-A F1 minus Protocol-D F1)

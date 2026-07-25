@@ -1,0 +1,20 @@
+# Few-shot class registration (docs/08_EVALUATION.md §4.3, docs/13_EXPERIMENT_MATRIX.md E-FS-1..3).
+#
+# Protocol: open-set (B) with C_h holdout classes, then register each held-out
+# class from n ∈ {1,5,10,20,50} labelled samples.
+#
+# Key claim (C1): old-class macro-F1 delta is exactly 0.000 because
+# register_class() changes zero model parameters.
+
+data:
+  protocol: B
+  holdout_size: 3
+  holdout_repeats: 5
+
+train:
+  stage1_epochs: 30
+  stage2_epochs: 10
+
+# Registration sizes to evaluate
+few_shot_n: [1, 5, 10, 20, 50]
+few_shot_seeds: [0, 1, 2, 3, 4]

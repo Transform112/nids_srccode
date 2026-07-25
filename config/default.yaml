@@ -1,0 +1,180 @@
+# ARGUS base configuration.
+# Every tunable value lives here. No magic numbers in code.
+run:
+  seed: 0
+  device: cuda
+  precision: bf16
+  deterministic: true
+  out_dir: results/runs
+  registry: results/runs/registry.jsonl
+
+paths:
+  dataset_dir: dataset
+  interim_dir: data/interim
+  processed_dir: data/processed
+  artifact_dir: data/artifacts
+  cache_dir: data/processed/cache
+
+data:
+  dataset: cicids2018
+  protocol: A
+  subsample_target: 4000000
+  minority_threshold: 200000
+  benign_floor_fraction: 0.50
+  dedup: true
+  drop_null_labels: true
+  time_bins_for_subsample: 100
+  holdout_size: 3
+  holdout_repeats: 5
+  holdout_seed: 1234
+
+features:
+  te1_enabled: true
+  te2_enabled: true
+  te7_enabled: true
+  quantile_n: 1000
+  quantile_subsample: 1000000
+  clip_post_transform: 5.0
+  eps: 1.0e-6
+  protocol_topk: 8
+  l7_proto_topk: 16
+  dst_port_topk: 32
+  spectral_nbins: 64
+  spectral_min_flows: 8
+
+graph:
+  node_granularity: ip
+  anchor_bin_seconds: 1
+  window_short_seconds: 1
+  window_mid_seconds: 30
+  window_long_seconds: 300
+  neighbour_cap: 32
+  sampling: recency_stratified
+  strata: 4
+  memory_evict_seconds: 600
+
+model:
+  name: argus
+  d_h: 128
+  d_A: 48
+  d_B: 80
+  d_t: 16
+  d_z: 64
+  layers: 2
+  heads: 4
+  aggregation: trimmed
+  trim_beta: 0.20
+  soft_medoid_temp: 1.0
+  multi_aggregator: true
+  time_encoding: time2vec
+  time2vec_period_min: 0.1
+  time2vec_period_max: 600.0
+  norm_node: graphnorm
+  norm_mlp: layernorm
+  prenorm: true
+  te3_enabled: true
+  te4_enabled: true
+  te5_enabled: true
+  te6_enabled: true
+
+head:
+  type: epc
+  sub_prototypes_benign: 4
+  sub_prototypes_attack_large: 2
+  sub_prototypes_attack_small: 1
+  margin_m: 0.35
+  tau_start: 1.0
+  tau_final: 0.10
+  tau_anneal_epochs: 6
+  tau_min: 0.02
+  log_evidence_clamp: 15.0
+  am_softmax_margin: 0.35
+  am_softmax_scale_start: 10.0
+  am_softmax_scale_final: 30.0
+  am_softmax_warmup_epochs: 5
+  fp32_head: true
+  theta_unknown: null
+  theta_defer: null
+  target_false_unknown_rate: 0.05
+  target_defer_rate: 0.02
+
+regularisation:
+  dropout: 0.10
+  droppath: 0.05
+  dropedge: 0.10
+  edge_feature_dropout_a: 0.05
+  edge_feature_dropout_b: 0.0
+  memory_dropout: 0.10
+  weight_decay: 1.0e-4
+  label_smoothing: 0.05
+
+loss:
+  lambda_compact: 0.10
+  lambda_channel: 0.05
+  channel_ratio_tolerance: 0.5
+  channel_penalty_stride: 4
+  lambda_div: 0.05
+  lambda_unknown: 1.00
+  lambda_kl_max: 0.10
+  kl_anneal_epochs: 10
+  synth_unknown_ratio: 0.20
+  mixup_mu_low: 0.35
+  mixup_mu_high: 0.65
+  cos_reject: 0.90
+  structural_candidates: 64
+  effective_number_nu: 0.999
+
+train:
+  stage1_epochs: 30
+  stage1_lr: 3.0e-4
+  stage1_patience: 5
+  stage2_epochs: 10
+  stage2_lr: 5.0e-5
+  stage2_patience: 3
+  stage3_joint_finetune: false
+  batch_anchor_bins: 64
+  n_per_class: 32
+  min_classes_per_batch: 8
+  bptt_chunk: 8
+  warmup_epochs: 3
+  grad_clip: 1.0
+  min_count_for_prototype: 100
+  checkpoint_every_epoch: true
+
+gates:
+  g0_capacity_check: true
+  g0_subset_size: 1000
+  g0_required_train_acc: 0.99
+  g1_min_val_f1_epoch5: 0.5
+  g2_max_proto_cosine: 0.8
+  g3_max_known_vacuity: 0.7
+  g4_min_unknown_vacuity: 0.5
+  g5_max_channel_ratio: 0.8
+  g7_max_train_val_gap: 0.10
+  monitor_every_steps: 100
+
+eval:
+  metrics_seeds: [0, 1, 2, 3, 4]
+  bootstrap_resamples: 10000
+  ece_bins: 15
+  ece_binning: equal_mass
+  few_shot_n: [1, 5, 10, 20, 50]
+  openness_holdout_sizes: [1, 2, 3, 4]
+
+attack:
+  a1_steps: 40
+  a1_epsilons: [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+  a2_budgets: [0, 1, 2, 4, 8, 16, 32, 64]
+  a2_spread: all_strata
+  a3_poison_rates: [0.001, 0.005, 0.01, 0.05, 0.1]
+  a4_steps: 100
+  a5_jitter_sigmas: [0.05, 0.1, 0.25, 0.5, 1.0]
+
+xai:
+  topk_edges: 10
+  topk_features: 15
+  ig_steps: 50
+  gnnexplainer_epochs: 200
+  pgexplainer_epochs: 30
+  shap_nsamples: 200
+  stability_n_perturb: 20
