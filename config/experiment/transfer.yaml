@@ -1,0 +1,20 @@
+# Cross-dataset transfer (docs/08_EVALUATION.md §4.4, docs/13_EXPERIMENT_MATRIX.md E-TR-*).
+#
+# Train on one dataset, test on another. Identical 55-column schemas but disjoint
+# label vocabularies — evaluation is by family mapping (dos, ddos, brute, web, other)
+# plus unknown detection.
+#
+# Transfer is the ultimate control for host identity leakage (TRAP 3): no host
+# appears in both datasets, so any transfer performance cannot be identity memorisation.
+
+data:
+  protocol: C
+
+train:
+  stage1_epochs: 30
+  stage2_epochs: 10
+
+# Source → target pairs
+transfer_pairs:
+  - [cicids2018, ton_iot]
+  - [ton_iot, cicids2018]

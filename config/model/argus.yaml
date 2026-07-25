@@ -1,0 +1,5 @@
+# Full ARGUS model (SR-TEG encoder + EPC head).
+model:
+  name: argus
+head:
+  type: epc

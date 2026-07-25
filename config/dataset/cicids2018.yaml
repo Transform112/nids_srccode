@@ -1,0 +1,49 @@
+# Primary dataset: NF-CICIDS2018-v3
+# 20,115,529 rows, 181,876 source IPs, 14 attack classes.
+data:
+  dataset: cicids2018
+  node_granularity: ip
+graph:
+  node_granularity: ip
+
+classes:
+  benign: Benign
+  attacks:
+    - DDOS_attack-HOIC
+    - FTP-BruteForce
+    - DDoS_attacks-LOIC-HTTP
+    - Bot
+    - SSH-Bruteforce
+    - Infilteration
+    - DoS_attacks-SlowHTTPTest
+    - DoS_attacks-Hulk
+    - DoS_attacks-GoldenEye
+    - DoS_attacks-Slowloris
+    - DDOS_attack-LOIC-UDP
+    - Brute_Force_-Web
+    - Brute_Force_-XSS
+    - SQL_Injection
+  canonical:
+    Infilteration: Infiltration
+  families:
+    dos:
+      - DoS_attacks-Hulk
+      - DoS_attacks-GoldenEye
+      - DoS_attacks-Slowloris
+      - DoS_attacks-SlowHTTPTest
+    ddos:
+      - DDOS_attack-HOIC
+      - DDOS_attack-LOIC-UDP
+      - DDoS_attacks-LOIC-HTTP
+    brute:
+      - FTP-BruteForce
+      - SSH-Bruteforce
+      - Brute_Force_-Web
+      - Brute_Force_-XSS
+    web:
+      - SQL_Injection
+      - Brute_Force_-XSS
+      - Brute_Force_-Web
+    other:
+      - Bot
+      - Infiltration

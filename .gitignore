@@ -1,0 +1,40 @@
+# Data and results — top-level only
+/dataset/
+/results/
+/data/
+*.pt
+*.pth
+*.parquet
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Claude
+.claude/
+
+# Zip archives
+*.zip

@@ -1,0 +1,19 @@
+# Flow-timeout stability ablation (docs/08_EVALUATION.md §4.7, docs/13_EXPERIMENT_MATRIX.md E-TO-1).
+#
+# Vary the effective exporter timeout by re-aggregating flow records. Compare F1
+# variance across timeouts for ARGUS vs a flow-independent baseline (Extra Trees)
+# and a single-scale GNN.
+#
+# ARGUS's windowed graph should be less sensitive to exporter timeout settings
+# than flow-only models. This is cheap to run and strengthens the deployability
+# argument.
+
+data:
+  protocol: A
+
+timeout:
+  values: [15, 30, 60, 120, 300, 600]  # effective timeout in seconds
+  default: 120
+
+# Run ARGUS, ARGUS-single-scale (mid only), Extra Trees across the 6 values.
+# Report: F1 variance (σ/μ), worst-case F1 drop from default.

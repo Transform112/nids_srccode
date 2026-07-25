@@ -1,0 +1,29 @@
+# Adversarial evaluation (docs/10_ADVERSARIAL.md, docs/13_EXPERIMENT_MATRIX.md E-ADV-*).
+#
+# Five attacks run against a trained Stage-2 model:
+#   A1 — feature-space PGD on edge features (SPSA-estimated)
+#   A2 — structural edge injection (headline C2 attack)
+#   A3 — prototype poisoning via EMA drift
+#   A4 — adaptive attacker with Channel-A + timing control
+#   A5 — temporal jitter
+#
+# Key claim (C2): ARGUS retains substantially more macro-F1 than E-GraphSAGE at
+# equal injection budget under A2.
+
+data:
+  protocol: A
+
+model:
+  aggregation: trimmed        # primary; also sweep mean (C2 control)
+
+attack:
+  a1_steps: 40
+  a1_epsilons: [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+  a2_budgets: [0, 1, 2, 4, 8, 16, 32, 64]
+  a2_spread: all_strata       # also sweep single_stratum
+  a3_poison_rates: [0.001, 0.005, 0.01, 0.05, 0.1]
+  a4_steps: 100
+  a5_jitter_sigmas: [0.05, 0.1, 0.25, 0.5, 1.0]
+
+# Report: robust macro-F1 @ budget, ASR, empirical breakdown point,
+# unknown-evasion rate (docs/08_EVALUATION.md §4.5).

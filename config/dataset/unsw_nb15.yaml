@@ -1,0 +1,20 @@
+# Tertiary dataset: NF-UNSW-NB15-v3
+# Only 40 unique source IPs: IP-level graphs degenerate, so force ip_port nodes.
+data:
+  dataset: unsw_nb15
+  node_granularity: ip_port
+graph:
+  node_granularity: ip_port
+
+classes:
+  benign: Benign
+  attacks:
+    - Exploits
+    - Fuzzers
+    - Generic
+    - Reconnaissance
+    - DoS
+    - Backdoor
+    - Shellcode
+    - Analysis
+    - Worms

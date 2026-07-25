@@ -1,0 +1,26 @@
+# XAI evaluation (docs/11_XAI.md, docs/13_EXPERIMENT_MATRIX.md E-XAI-*).
+#
+# Native evidence attribution + baseline explainers (GNNExplainer, PGExplainer,
+# KernelSHAP, attention-weights, counterfactual necessity) evaluated on fidelity,
+# sparsity, necessity, and stability.
+#
+# Key claim (C4): injected adversarial edges receive near-zero attribution mass
+# under trimmed-mean aggregation but not under mean aggregation (figure F7).
+
+data:
+  protocol: A
+
+model:
+  aggregation: trimmed        # primary; also sweep mean for F7 contrast
+
+xai:
+  topk_edges: 10
+  topk_features: 15
+  ig_steps: 50
+  gnnexplainer_epochs: 200
+  pgexplainer_epochs: 30
+  shap_nsamples: 200
+  stability_n_perturb: 20
+
+# Report: fidelity±, sparsity, necessity, stability (Spearman ρ),
+# F7 injection-attribution plot, UNKNOWN triage report.

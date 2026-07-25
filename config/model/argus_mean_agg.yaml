@@ -1,0 +1,6 @@
+# Ablation: robust aggregation removed; isolates C2.
+model:
+  name: argus
+  aggregation: mean
+head:
+  type: epc

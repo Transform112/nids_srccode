@@ -1,0 +1,15 @@
+# Degenerate case: NF-BoT-IoT-v3
+# 20 source IPs and 99.69% attack prevalence. Used only for explicit negative result.
+data:
+  dataset: bot_iot
+  node_granularity: ip_port
+graph:
+  node_granularity: ip_port
+
+classes:
+  benign: Benign
+  attacks:
+    - DoS
+    - DDoS
+    - Reconnaissance
+    - Theft

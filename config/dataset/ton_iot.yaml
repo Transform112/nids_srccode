@@ -1,0 +1,19 @@
+# Secondary dataset: NF-ToN-IoT-v3
+data:
+  dataset: ton_iot
+  node_granularity: ip
+graph:
+  node_granularity: ip
+
+classes:
+  benign: Benign
+  attacks:
+    - ddos
+    - xss
+    - password
+    - scanning
+    - injection
+    - dos
+    - Backdoor
+    - mitm
+    - ransomware
