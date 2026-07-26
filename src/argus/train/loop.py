@@ -56,6 +56,8 @@ def run_epoch(
     bptt_chunk: int = 8,
     max_bins: int | None = None,
     channel_penalty: dict | None = None,
+    label: str = "",
+    log_every_bins: int = 50,
 ) -> EpochResult:
     """Run one epoch (or eval pass) over all anchor bins in `source`.
 
@@ -77,6 +79,9 @@ def run_epoch(
     memory_state = memory_state if memory_state is not None else {}
 
     bins = source.unique_bins[:max_bins] if max_bins else source.unique_bins
+    total = len(bins)
+    prefix = f"[{label}] " if label else ""
+    mode_str = "train" if train else "eval"
     for i, bin_id in enumerate(bins):
         batch = source.build_bin_batch(bin_id, f_v=model.f_v)
         if batch is None or batch["n_targets"] == 0:
@@ -114,5 +119,12 @@ def run_epoch(
         n_batches += 1
         n_targets += len(targets)
         correct += n_correct
+
+        if (i + 1) % log_every_bins == 0:
+            pct = (i + 1) / total * 100
+            avg_loss = total_loss / n_batches
+            acc = correct / n_targets if n_targets else 0.0
+            print(f"  {prefix}{mode_str} {i + 1}/{total} bins ({pct:.0f}%)  "
+                  f"loss={avg_loss:.4f}  acc={acc:.4f}")
 
     return EpochResult(loss=total_loss / max(n_batches, 1), n_batches=n_batches, n_targets=n_targets, correct=correct)

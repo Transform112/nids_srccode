@@ -117,8 +117,12 @@ def train_stage2(
         train_result = run_epoch(
             train_source, model, optimizer, loss_fn, device, train=True,
             grad_clip=cfg.train.grad_clip, bptt_chunk=cfg.train.bptt_chunk, max_bins=max_bins,
+            label=f"S2 e{epoch}",
         )
-        val_result = run_epoch(val_source, model, None, loss_fn, device, train=False, max_bins=max_bins)
+        val_result = run_epoch(
+            val_source, model, None, loss_fn, device, train=False, max_bins=max_bins,
+            label=f"S2 e{epoch} val",
+        )
         history.append(
             {"epoch": epoch, "train_loss": train_result.loss, "train_acc": train_result.accuracy,
              "val_loss": val_result.loss, "val_acc": val_result.accuracy}

@@ -96,9 +96,11 @@ def train_stage1(
             train_source, model, optimizer, loss_fn, device, train=True,
             grad_clip=cfg.train.grad_clip, bptt_chunk=cfg.train.bptt_chunk, max_bins=max_bins,
             channel_penalty=channel_penalty_cfg,
+            label=f"S1 e{epoch}",
         )
         val_result = run_epoch(
             val_source, model, None, loss_fn, device, train=False, max_bins=max_bins,
+            label=f"S1 e{epoch} val",
         )
         history.append(
             {"epoch": epoch, "train_loss": train_result.loss, "train_acc": train_result.accuracy,
