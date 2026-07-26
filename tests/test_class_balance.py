@@ -217,6 +217,54 @@ def test_capping_reorders_which_class_dominates():
     assert capped[0] < capped[1]
 
 
+# --- the refactor must be a no-op at default settings -------------------------
+
+def test_default_loss_matches_the_pre_refactor_formulation():
+    """G0 dropped 0.9947 -> 0.9360 across the runs that bracket this refactor,
+    so the refactored closure must be provably identical when the imbalance
+    knobs are off — otherwise it is a suspect.
+
+    Transcribes the pre-#50 body: unconditional prototype centroid, unmasked
+    AM-Softmax and compactness over every target, plus diversity.
+    """
+    from argus.config import load_config
+    from argus.losses.am_softmax import AMSoftmaxLoss, CompactnessLoss
+    from argus.models.argus import ArgusModel
+    from argus.train.stage1_encoder import _class_prototype_centroid, make_stage1_loss_fn
+
+    cfg = load_config(overrides=["model.layers=1", "graph.neighbour_cap=8"])
+    class_names = ["Benign", "Bot", "FTP-BruteForce"]
+    torch.manual_seed(0)
+    model = ArgusModel(cfg, f_e=147, f_v=18, class_names=class_names)
+
+    torch.manual_seed(1)
+    outputs = {
+        "cos_c": torch.randn(24, 3, requires_grad=True),
+        "z": torch.nn.functional.normalize(torch.randn(24, cfg.model.d_z), dim=-1),
+    }
+    targets = torch.randint(0, 3, (24,))
+    am, cmp_ = AMSoftmaxLoss(), CompactnessLoss()
+    lam_c, lam_d, epoch = cfg.loss.lambda_compact, cfg.loss.lambda_div, 3
+
+    new_loss, new_correct, new_pred = make_stage1_loss_fn(
+        am, cmp_, lam_c, lam_d, epoch)(outputs, targets, model)
+
+    protos = _class_prototype_centroid(model.head.prototype_bank, 3)
+    old_loss = am(outputs["cos_c"], targets, epoch=epoch)
+    old_loss = old_loss + lam_c * cmp_(outputs["z"], protos, targets)
+    old_loss = old_loss + lam_d * model.head.prototype_bank.diversity_loss()
+
+    assert float(new_loss) == pytest.approx(float(old_loss), rel=1e-6)
+    assert new_correct == int((outputs["cos_c"].argmax(1) == targets).sum())
+    assert torch.equal(new_pred, outputs["cos_c"].argmax(1))
+
+    # Gradients too — an equal scalar with a different graph would still change
+    # the optimisation trajectory.
+    g_new = torch.autograd.grad(new_loss, outputs["cos_c"], retain_graph=True)[0]
+    g_old = torch.autograd.grad(old_loss, outputs["cos_c"])[0]
+    assert torch.allclose(g_new, g_old, atol=1e-7)
+
+
 # --- macro-F1 as the selection metric ----------------------------------------
 
 def _confusion_for(preds_by_true: dict[int, dict[int, int]], c: int) -> torch.Tensor:

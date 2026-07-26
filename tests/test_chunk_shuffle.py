@@ -70,13 +70,14 @@ def _loss_fn(outputs, targets, model):
     return outputs["z"].sum() * 0.0 + outputs["z"].pow(2).mean(), 0
 
 
-def _run(shuffle: bool, seed: int = 0):
+def _run(shuffle: bool, seed: int = 0, group: int = 1, n_bins: int = 20,
+         bptt_chunk: int = 4):
     torch.manual_seed(seed)
     model = _StubModel()
     opt = torch.optim.SGD(model.parameters(), lr=0.0)
-    run_epoch(_StubSource(), model, opt, _loss_fn, torch.device("cpu"),
-              train=True, bptt_chunk=4, log_every_bins=10**9,
-              shuffle_chunks=shuffle)
+    run_epoch(_StubSource(n_bins), model, opt, _loss_fn, torch.device("cpu"),
+              train=True, bptt_chunk=bptt_chunk, log_every_bins=10**9,
+              shuffle_chunks=shuffle, shuffle_group_chunks=group)
     return model.seen
 
 
@@ -129,3 +130,55 @@ def test_memory_is_cleared_at_shuffled_chunk_boundaries():
               log_every_bins=10**9, shuffle_chunks=True)
     # Only the final chunk's 4 bins (2 nodes each) may remain.
     assert len(mem) <= 8, f"memory leaked across shuffled chunks: {len(mem)} entries"
+
+
+# --- segment grouping ---------------------------------------------------------
+#
+# Clearing memory at every chunk means a node's TE6 state never spans more than
+# `bptt_chunk` bins in training, while eval accumulates it across the whole
+# split. Grouping consecutive chunks into one shuffled segment restores the
+# span without changing memory cost — gradient is still truncated per chunk.
+
+def test_grouping_still_visits_every_bin_once():
+    seen = _run(shuffle=True, group=3, n_bins=24, bptt_chunk=2)
+    assert sorted(seen) == list(range(24))
+
+
+def test_grouped_segments_stay_contiguous_and_ordered():
+    """A segment of 3 chunks x 2 bins is 6 consecutive bins in time order."""
+    seen = _run(shuffle=True, group=3, n_bins=24, bptt_chunk=2)
+    for start in range(0, len(seen), 6):
+        block = seen[start:start + 6]
+        assert block == sorted(block), f"segment {block} out of order"
+        assert block[-1] - block[0] == len(block) - 1, f"segment {block} not contiguous"
+
+
+def test_memory_span_grows_with_the_group_size():
+    """The point of the knob: memory survives the inner chunk boundaries, so
+    more nodes are live at the end of a segment than at the end of a chunk."""
+    spans = {}
+    for group in (1, 4):
+        torch.manual_seed(0)
+        model = _StubModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.0)
+        mem: dict = {}
+        run_epoch(_StubSource(24), model, opt, _loss_fn, torch.device("cpu"),
+                  train=True, bptt_chunk=2, memory_state=mem, log_every_bins=10**9,
+                  shuffle_chunks=True, shuffle_group_chunks=group)
+        spans[group] = len(mem)
+    assert spans[4] > spans[1], f"grouping did not extend the memory span: {spans}"
+
+
+def test_group_of_one_matches_ungrouped_behaviour():
+    assert _run(shuffle=True, group=1, seed=7) == _run(shuffle=True, seed=7)
+
+
+def test_grouping_still_breaks_up_the_single_class_tail():
+    """Grouping must not undo the fix it is built on top of."""
+    tails = {tuple(_run(shuffle=True, group=2, seed=s, n_bins=24, bptt_chunk=2)[-4:])
+             for s in range(8)}
+    assert len(tails) > 1, "grouped shuffling produced a fixed epoch tail"
+
+
+def test_grouping_is_ignored_when_not_shuffling():
+    assert _run(shuffle=False, group=8) == list(range(20))

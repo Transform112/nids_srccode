@@ -1041,6 +1041,95 @@ Full suite: **155 passed**.
 
 ---
 
+## Session 2026-07-27, part 6 — two consequences of the chunk-shuffle fix
+
+Both surfaced when Stage-1 was relaunched and died 32 minutes in.
+
+### #54 G0 false failure: the gate read the last epoch, not the best
+
+`G0 capacity check: train_acc=0.9360 (required >= 0.99)` — after 150 epochs on
+the same 938-flow subset that scored **0.9947** on the previous run, with no
+change to the architecture or the features between them.
+
+**Two hypotheses, both tested, both wrong.**
+
+*Hypothesis 1 — chunk shuffling (#49).* `run_epoch` had just started defaulting
+to `shuffle_chunks=True`, and G0 had not run since; the two intervening Kaggle
+runs both passed `--skip-gate0`. Shuffling also *clears* TE6 memory every
+chunk, which plausibly makes memorisation harder. Ran the real preflight both
+ways on the real subset, same seed, 60 epochs:
+
+| | final train acc |
+|---|---:|
+| `shuffle_chunks=False` | 0.9158 |
+| `shuffle_chunks=True` | **0.9296** |
+
+Shuffling is if anything slightly *better*, and much faster early — 0.3507 vs
+0.0778 at epoch 5, which makes sense once classes stop arriving in blocks.
+Hypothesis refuted; the `shuffle_chunks=False` change written against it was
+reverted before shipping.
+
+*Hypothesis 2 — the imbalance refactor (#50–#53).* It rewrote the Stage-1 loss
+closure, and G0 calls it at defaults. Settled with a test rather than an
+argument: `test_default_loss_matches_the_pre_refactor_formulation` transcribes
+the pre-#50 body and asserts the refactored closure matches it in loss value
+(`rel=1e-6`) *and* in gradient w.r.t. `cos_c` (`atol=1e-7`) — an equal scalar
+reached through a different graph would still move the trajectory. It matches.
+Refuted.
+
+**Actual cause: the gate was a coin flip.** G0 read `result.accuracy` from the
+*final* epoch. The memorisation trajectory oscillates hard — measured on this
+exact subset, adjacent epochs go 0.4403 → 0.4200, 0.6908 → 0.6429, 0.9115 →
+0.9019 — so whichever epoch happened to be last set the verdict, from a band
+several points wide. GPU reductions are not bit-reproducible either, so the
+same configuration genuinely can land at 0.9947 once and 0.9360 the next time.
+
+**Fix.** Judge on the best epoch seen, not the last. G0 asks whether the
+architecture *can* represent the mapping — its own docstring says "trained
+until it memorises the subset or runs out of attempts", which is a question
+about an event, not a final state. The 0.99 bar is unchanged; the gate now
+reports which epoch reached it.
+
+### The train/eval memory-span asymmetry the #49 fix introduced
+
+Found while testing hypothesis 1 above. Worth recording as a real cost, not a
+footnote. Before #49, training detached
+TE6 memory at each chunk boundary but kept its *values*, so memory accumulated
+across the epoch — the same regime evaluation runs in. After #49 it is
+*cleared* at every shuffled boundary, because a carried-over state after a time
+jump describes a different moment. With the OOM-forced `bptt_chunk=2`
+(docs/BUGS.md #48) that leaves the GRU **trained on 20-second histories and
+evaluated on hours of them**.
+
+The trade is still strongly worth it — shuffling took validation from 0.0000 to
+0.5361 — but it is a train/eval mismatch that did not exist before, on the
+component (TE6 per-node memory) that is one of the architecture's headline
+claims.
+
+**Mitigation implemented:** `run_epoch(shuffle_group_chunks=N)` and
+`train.shuffle_group_chunks` group N consecutive BPTT chunks into one shuffled
+segment. Memory is cleared per *segment* instead of per chunk, so the span
+becomes `N * bptt_chunk` bins, while gradient truncation still happens every
+`bptt_chunk` bins — memory cost is unchanged, which is what makes this
+affordable under #48. Class mixing is unaffected while a segment stays well
+short of a campaign block: at `N = 16, bptt_chunk = 2` a segment is 32 bins
+(320 s, aligned with `window_long_seconds = 300`) against a `bot` block of
+~930 bins.
+
+**Left at `N = 1` for the current run — deliberately.** The only configuration
+with real evidence behind it is `N = 1` (the 0.5361 epoch), and this run's
+change under test is the imbalance work. Changing two things at once would make
+the result unattributable. `N` is the first lever to pull if Stage-1's macro-F1
+disappoints.
+
+**Verified:** `tests/test_chunk_shuffle.py` grew 6 tests — every bin still
+visited once under grouping, segments contiguous and time-ordered, the memory
+span demonstrably longer at `N = 4` than `N = 1`, `N = 1` bit-identical to the
+ungrouped path, the single-class tail still broken up, and grouping ignored
+when not shuffling.
+
+---
+
 ## Decisions needed (updated after part 3)
 
 Every item from the original "Decisions needed" list is now RESOLVED

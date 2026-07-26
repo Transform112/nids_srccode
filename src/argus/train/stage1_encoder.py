@@ -251,6 +251,7 @@ def train_stage1(
             train_source, model, optimizer, train_loss_fn, device, train=True,
             grad_clip=cfg.train.grad_clip, bptt_chunk=cfg.train.bptt_chunk, max_bins=max_bins,
             channel_penalty=channel_penalty_cfg,
+            shuffle_group_chunks=getattr(cfg.train, "shuffle_group_chunks", 1),
             label=f"S1 e{epoch}", metric_ignore_class_ids=excluded_ids,
         )
         val_result = run_epoch(

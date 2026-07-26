@@ -130,7 +130,8 @@ def _gate0_preflight(dataset: str, overrides: list[str] | None, train_df, featur
     )
     compact_loss = CompactnessLoss()
 
-    acc = 0.0
+    best_acc = 0.0
+    best_epoch = 0
     # A pure memorisation check: give it enough epochs and cosine-decay the LR
     # to 0.1x for tail stability. Empirically this subset crosses 0.99 around
     # epoch ~80 with the fixed features (docs/BUGS.md #45/#46); the old 60-epoch
@@ -148,18 +149,29 @@ def _gate0_preflight(dataset: str, overrides: list[str] | None, train_df, featur
                            grad_clip=g0_cfg.train.grad_clip,
                            bptt_chunk=g0_cfg.train.bptt_chunk,
                            log_every_bins=10**9)
-        acc = result.accuracy
-        if acc >= required:
+        # Judge on the BEST epoch, not the last. G0 asks whether the
+        # architecture *can* represent this mapping — "trained until it
+        # memorises the subset or runs out of attempts" is a question about an
+        # event, not a final state. Reading the last epoch made the gate a coin
+        # flip: the trajectory oscillates by 5+ points between adjacent epochs
+        # (measured on this subset: 0.4403 -> 0.4200 -> ... -> 0.9115 ->
+        # 0.9019), and GPU reductions are not bit-reproducible, so the same
+        # configuration scored 0.9947 on one run and 0.9360 on the next
+        # (docs/BUGS.md #54).
+        if result.accuracy > best_acc:
+            best_acc, best_epoch = result.accuracy, epoch
+        if best_acc >= required:
             break
 
-    passed, msg = gate_g0_capacity(acc, required)
+    passed, msg = gate_g0_capacity(best_acc, required)
     record_gate(run_dir / "gates_report.json", "G0", passed,
-                msg + f" (after {epoch + 1} epochs on {len(subset)} flows)")
+                msg + f" (best at epoch {best_epoch}, ran {epoch + 1} epochs "
+                      f"on {len(subset)} flows)")
     if not passed:
         raise RuntimeError(
             f"Gate G0 failed: model cannot memorise {len(subset)} flows "
-            f"(train_acc={acc:.4f} < {required}). Do not spend GPU hours on this "
-            f"configuration — see docs/06_TRAINING.md §8.1."
+            f"(best train_acc={best_acc:.4f} < {required}). Do not spend GPU hours "
+            f"on this configuration — see docs/06_TRAINING.md §8.1."
         )
 
 

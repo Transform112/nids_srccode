@@ -85,7 +85,8 @@ SECTION_SCHEMA: dict[str, set[str]] = {
     "train": {
         "stage1_epochs", "stage1_lr", "stage1_patience", "stage2_epochs", "stage2_lr",
         "stage2_patience", "stage3_joint_finetune", "batch_anchor_bins", "n_per_class",
-        "min_classes_per_batch", "bptt_chunk", "warmup_epochs", "grad_clip",
+        "min_classes_per_batch", "bptt_chunk", "shuffle_group_chunks",
+        "warmup_epochs", "grad_clip",
         "min_count_for_prototype", "checkpoint_every_epoch",
     },
     "gates": {

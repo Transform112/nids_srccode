@@ -113,6 +113,7 @@ def run_epoch(
     label: str = "",
     log_every_bins: int = 50,
     shuffle_chunks: bool = True,
+    shuffle_group_chunks: int = 1,
     num_classes: int | None = None,
     metric_ignore_class_ids: Sequence[int] = (),
 ) -> EpochResult:
@@ -162,6 +163,18 @@ def run_epoch(
     truncated-BPTT sequence models. Evaluation always runs sequentially with
     continuous memory, so inference-time long-horizon context is unaffected.
 
+    `shuffle_group_chunks` sets how many *consecutive* BPTT chunks stay
+    together as one shuffled segment. Shuffling clears TE6 memory at every
+    segment boundary, so at the default of 1 a node's memory never spans more
+    than `bptt_chunk` bins during training — while evaluation runs sequentially
+    and accumulates memory over the whole split. That asymmetry is a real cost
+    of the #49 fix: with `bptt_chunk=2` the GRU is trained on 20-second
+    histories and evaluated on hours of them. Grouping restores the span
+    (`shuffle_group_chunks * bptt_chunk` bins) without changing memory cost,
+    because gradient truncation still happens every `bptt_chunk` bins — only
+    the memory *values* carry across the inner boundaries. Class mixing is
+    unaffected as long as a segment stays well short of a campaign block.
+
     Note: shuffling assumes node features come from the graph cache (built in
     one sequential pass, so the `is_new_host` feature is already correct).
     Training uncached with shuffling would compute that feature against a
@@ -203,92 +216,101 @@ def run_epoch(
     prefix = f"[{label}] " if label else ""
     mode_str = "train" if train else "eval"
 
-    # Split the timeline into contiguous BPTT chunks, then choose the order in
-    # which to visit them. Sequential for eval; shuffled for training (see the
-    # docstring — a time-ordered stream is also a class-ordered stream here).
+    # Split the timeline into contiguous BPTT chunks, then group consecutive
+    # chunks into segments and choose the order in which to visit the segments.
+    # Sequential for eval; shuffled for training (see the docstring — a
+    # time-ordered stream is also a class-ordered stream here).
     chunks = [bins[s:s + bptt_chunk] for s in range(0, total, bptt_chunk)]
     do_shuffle = bool(train and shuffle_chunks and optimizer is not None)
     if do_shuffle:
+        g = max(1, shuffle_group_chunks)
+        segments = [chunks[i:i + g] for i in range(0, len(chunks), g)]
         # torch's generator so the epoch order is covered by the RNG state that
         # checkpoint/resume already saves and restores.
-        order = torch.randperm(len(chunks)).tolist()
-        chunks = [chunks[j] for j in order]
+        order = torch.randperm(len(segments)).tolist()
+        segments = [segments[j] for j in order]
+    else:
+        segments = [[c] for c in chunks]
 
     i = -1
-    for chunk in chunks:
+    for segment in segments:
         if do_shuffle:
             # A shuffled boundary jumps in time, so a carried-over node state
-            # would describe a different moment. Start each chunk cold.
+            # would describe a different moment. Start each segment cold.
             memory_state.clear()
-        for bin_id in chunk:
-            i += 1
-            batch = source.build_bin_batch(bin_id, f_v=model.f_v)
-            if batch is None or batch["n_targets"] == 0:
-                continue
-            inputs = model_inputs_from_batch(batch, device)
-            target_edge_attr = inputs[-1]
-            apply_penalty = (
-                channel_penalty is not None and train and (i % channel_penalty["stride"] == 0)
-            )
-            if apply_penalty:
-                target_edge_attr.requires_grad_(True)
-            targets = batch["target_labels"].to(device)
-            node_ids = batch["node_ids"].to(device)
-
-            with torch.set_grad_enabled(train):
-                outputs = model(*inputs, memory=memory_state, node_ids=node_ids)
-                returned = loss_fn(outputs, targets, model)
-                loss, n_correct = returned[0], returned[1]
-                preds = returned[2] if len(returned) > 2 else None
+        for chunk in segment:
+            for bin_id in chunk:
+                i += 1
+                batch = source.build_bin_batch(bin_id, f_v=model.f_v)
+                if batch is None or batch["n_targets"] == 0:
+                    continue
+                inputs = model_inputs_from_batch(batch, device)
+                target_edge_attr = inputs[-1]
+                apply_penalty = (
+                    channel_penalty is not None and train and (i % channel_penalty["stride"] == 0)
+                )
                 if apply_penalty:
-                    penalty = channel_penalty["module"](
-                        loss, target_edge_attr,
-                        channel_penalty["a_idx"], channel_penalty["b_idx"],
-                    )
-                    loss = loss + channel_penalty["stride"] * channel_penalty["lambda_ch"] * penalty
+                    target_edge_attr.requires_grad_(True)
+                targets = batch["target_labels"].to(device)
+                node_ids = batch["node_ids"].to(device)
 
-            if train and optimizer is not None:
-                chunk_loss = loss if chunk_loss is None else chunk_loss + loss
-                chunk_bins += 1
-
-            total_loss += float(loss.item())
-            n_batches += 1
-            n_targets += len(targets)
-            correct += n_correct
-
-            if preds is not None and confusion is not None:
-                with torch.no_grad():
-                    t = targets.reshape(-1)
-                    p = preds.reshape(-1).to(t.device)
-                    # A label outside the vocabulary means the cache and the
-                    # class vocab disagree — count it nowhere rather than
-                    # letting bincount silently overflow into another cell.
-                    ok = (t >= 0) & (t < n_cls) & (p >= 0) & (p < n_cls)
-                    if bool(ok.any()):
-                        flat = torch.bincount(
-                            (t[ok] * n_cls + p[ok]).to(torch.long), minlength=n_cls * n_cls
+                with torch.set_grad_enabled(train):
+                    outputs = model(*inputs, memory=memory_state, node_ids=node_ids)
+                    returned = loss_fn(outputs, targets, model)
+                    loss, n_correct = returned[0], returned[1]
+                    preds = returned[2] if len(returned) > 2 else None
+                    if apply_penalty:
+                        penalty = channel_penalty["module"](
+                            loss, target_edge_attr,
+                            channel_penalty["a_idx"], channel_penalty["b_idx"],
                         )
-                        confusion += flat.view(n_cls, n_cls).to(confusion.device)
+                        loss = loss + channel_penalty["stride"] * channel_penalty["lambda_ch"] * penalty
 
-            if (i + 1) % log_every_bins == 0:
-                pct = (i + 1) / total * 100
-                avg_loss = total_loss / n_batches
-                acc = correct / n_targets if n_targets else 0.0
-                # Running macro-F1 alongside accuracy: on this split the two
-                # diverge hard, and accuracy alone hid a total tail collapse
-                # for three runs (docs/BUGS.md #49, #52).
-                f1_str = ""
-                if confusion is not None:
-                    running = EpochResult(0.0, 0, 0, confusion=confusion.cpu(),
-                                          metric_ignore_class_ids=tuple(metric_ignore_class_ids))
-                    f1_str = f"  macroF1={running.macro_f1:.4f}"
-                print(f"  {prefix}{mode_str} {i + 1}/{total} bins ({pct:.0f}%)  "
-                      f"loss={avg_loss:.4f}  acc={acc:.4f}{f1_str}", flush=True)
+                if train and optimizer is not None:
+                    chunk_loss = loss if chunk_loss is None else chunk_loss + loss
+                    chunk_bins += 1
 
-        # Step at the chunk boundary — driven by the chunk structure itself, so
-        # a chunk whose trailing bins were empty still steps on what it did see.
-        if train and optimizer is not None:
-            _chunk_step()
+                total_loss += float(loss.item())
+                n_batches += 1
+                n_targets += len(targets)
+                correct += n_correct
+
+                if preds is not None and confusion is not None:
+                    with torch.no_grad():
+                        t = targets.reshape(-1)
+                        p = preds.reshape(-1).to(t.device)
+                        # A label outside the vocabulary means the cache and the
+                        # class vocab disagree — count it nowhere rather than
+                        # letting bincount silently overflow into another cell.
+                        ok = (t >= 0) & (t < n_cls) & (p >= 0) & (p < n_cls)
+                        if bool(ok.any()):
+                            flat = torch.bincount(
+                                (t[ok] * n_cls + p[ok]).to(torch.long), minlength=n_cls * n_cls
+                            )
+                            confusion += flat.view(n_cls, n_cls).to(confusion.device)
+
+                if (i + 1) % log_every_bins == 0:
+                    pct = (i + 1) / total * 100
+                    avg_loss = total_loss / n_batches
+                    acc = correct / n_targets if n_targets else 0.0
+                    # Running macro-F1 alongside accuracy: on this split the two
+                    # diverge hard, and accuracy alone hid a total tail collapse
+                    # for three runs (docs/BUGS.md #49, #52).
+                    f1_str = ""
+                    if confusion is not None:
+                        running = EpochResult(0.0, 0, 0, confusion=confusion.cpu(),
+                                              metric_ignore_class_ids=tuple(metric_ignore_class_ids))
+                        f1_str = f"  macroF1={running.macro_f1:.4f}"
+                    print(f"  {prefix}{mode_str} {i + 1}/{total} bins ({pct:.0f}%)  "
+                          f"loss={avg_loss:.4f}  acc={acc:.4f}{f1_str}", flush=True)
+
+            # Step at the chunk boundary — driven by the chunk structure
+            # itself, so a chunk whose trailing bins were empty still steps on
+            # what it did see. Gradient truncation therefore still happens
+            # every `bptt_chunk` bins even when a segment spans several chunks;
+            # only the memory *values* survive across the inner boundaries.
+            if train and optimizer is not None:
+                _chunk_step()
 
     if train and optimizer is not None:
         _chunk_step()

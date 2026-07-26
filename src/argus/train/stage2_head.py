@@ -210,6 +210,7 @@ def train_stage2(
         train_result = run_epoch(
             train_source, model, optimizer, loss_fn, device, train=True,
             grad_clip=cfg.train.grad_clip, bptt_chunk=cfg.train.bptt_chunk, max_bins=max_bins,
+            shuffle_group_chunks=getattr(cfg.train, "shuffle_group_chunks", 1),
             label=f"S2 e{epoch}",
         )
         val_result = run_epoch(
