@@ -113,6 +113,9 @@ def train_stage2(
 
     for epoch in range(cfg.train.stage2_epochs):
         model.head.anneal_tau(epoch)
+        print(f"[05] === Epoch {epoch}/{cfg.train.stage2_epochs} "
+              f"(tau={model.head.tau.item():.3f} best={best_val:.4f}) ===",
+              flush=True)
         loss_fn = make_stage2_loss_fn(evid_loss, cfg, epoch)
         train_result = run_epoch(
             train_source, model, optimizer, loss_fn, device, train=True,
@@ -127,17 +130,19 @@ def train_stage2(
             {"epoch": epoch, "train_loss": train_result.loss, "train_acc": train_result.accuracy,
              "val_loss": val_result.loss, "val_acc": val_result.accuracy}
         )
+        improved = val_result.accuracy > best_val
         print(f"[05] Epoch {epoch:2d}/{cfg.train.stage2_epochs}  "
-              f"train_loss={train_result.loss:.4f}  val_loss={val_result.loss:.4f}  "
-              f"val_acc={val_result.accuracy:.4f}  "
-              f"tau={model.head.tau.item():.3f}  "
-              f"{'*' if val_result.accuracy > best_val else f'patience={patience_left}'}")
+              f"train={train_result.loss:.4f}  val={val_result.loss:.4f}  "
+              f"acc={val_result.accuracy:.4f}  tau={model.head.tau.item():.3f}  "
+              f"{'NEW BEST' if improved else f'patience={patience_left}'}",
+              flush=True)
         if val_result.accuracy > best_val:
             best_val = val_result.accuracy
             patience_left = cfg.train.stage2_patience
         else:
             patience_left -= 1
             if patience_left <= 0:
+                print(f"[05] Early stop at epoch {epoch} — val_acc={best_val:.4f}")
                 break
 
     return {"history": history, "best_val_acc": best_val}

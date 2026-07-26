@@ -89,6 +89,8 @@ def train_stage1(
     history = []
 
     for epoch in range(cfg.train.stage1_epochs):
+        print(f"[04] === Epoch {epoch}/{cfg.train.stage1_epochs} (best={best_val:.4f}) ===",
+              flush=True)
         loss_fn = make_stage1_loss_fn(
             am_loss, compact_loss, cfg.loss.lambda_compact, cfg.loss.lambda_div, epoch
         )
@@ -106,16 +108,19 @@ def train_stage1(
             {"epoch": epoch, "train_loss": train_result.loss, "train_acc": train_result.accuracy,
              "val_loss": val_result.loss, "val_acc": val_result.accuracy}
         )
+        improved = val_result.accuracy > best_val
         print(f"[04] Epoch {epoch:2d}/{cfg.train.stage1_epochs}  "
-              f"train_loss={train_result.loss:.4f}  val_loss={val_result.loss:.4f}  "
-              f"val_acc={val_result.accuracy:.4f}  "
-              f"{'*' if val_result.accuracy > best_val else ''}{'patience=' + str(patience_left) if val_result.accuracy <= best_val else ''}")
+              f"train={train_result.loss:.4f}  val={val_result.loss:.4f}  "
+              f"acc={val_result.accuracy:.4f}  "
+              f"{'NEW BEST' if improved else f'patience={patience_left}'}",
+              flush=True)
         if val_result.accuracy > best_val:
             best_val = val_result.accuracy
             patience_left = cfg.train.stage1_patience
         else:
             patience_left -= 1
             if patience_left <= 0:
+                print(f"[04] Early stop at epoch {epoch} — val_acc={best_val:.4f}")
                 break
 
     return {"history": history, "best_val_acc": best_val}
