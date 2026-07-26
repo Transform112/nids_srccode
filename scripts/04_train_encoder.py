@@ -27,6 +27,8 @@ from argus.graph.batching import AnchorBinGraphSource  # noqa: E402
 from argus.graph.builder import assign_node_ids, enforce_trap1_guard  # noqa: E402
 from argus.graph.cache import CachedGraphSource  # noqa: E402
 from argus.graph.node_features import node_feature_dim  # noqa: E402
+from argus.graph.windows import assign_anchor_bins  # noqa: E402
+from argus.losses.class_balance import effective_target_counts  # noqa: E402
 from argus.models.argus import ArgusModel  # noqa: E402
 from argus.train.checkpoint import save_checkpoint  # noqa: E402
 from argus.train.stage1_encoder import train_stage1  # noqa: E402
@@ -235,9 +237,34 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     ).to(device)
 
     print(f"[04] Training Stage 1 on {device} ({len(class_names)} classes, F_e={f_e}) ...")
+    # Weights must describe the distribution the loss actually sees, which is
+    # the post-cap one — capping moves ddos_hoic 27.3%->3.6% and infiltration
+    # 7.6%->30.8% (docs/BUGS.md #51). Raw counts would weight those two
+    # identically and point the correction the wrong way.
+    n_per_class = getattr(cfg.train, "n_per_class", None)
+    # assign_anchor_bins needs ascending times, and labels must stay aligned to
+    # them — sort once and take both columns from the same ordering.
+    by_time = train_df.sort_values("FLOW_START_MILLISECONDS")
+    eff = effective_target_counts(
+        by_time["canonical_label"].map(label_to_id).to_numpy(),
+        assign_anchor_bins(by_time["FLOW_START_MILLISECONDS"].to_numpy(),
+                           cfg.graph.anchor_bin_seconds),
+        len(class_names), n_per_class,
+    )
+    weight_counts = {name: int(eff[i]) for i, name in enumerate(class_names)}
+    print(f"[04] Loss targets per epoch after n_per_class={n_per_class} capping: "
+          f"{sum(eff):,} of {len(train_df):,} flows", flush=True)
+
     result = train_stage1(model, train_source, val_source, cfg, device, max_bins=max_bins,
-                          run_dir=run_dir, resume=resume)
-    print(f"[04] Stage 1 best val accuracy proxy: {result['best_val_acc']:.4f}")
+                          run_dir=run_dir, resume=resume, class_counts=class_counts,
+                          weight_counts=weight_counts)
+    print(f"[04] Stage 1 best val macro-F1: {result['best_val_macro_f1']:.4f} "
+          f"(epoch {result['best_epoch']})")
+    for name, f1 in sorted(result["best_val_per_class_f1"].items(), key=lambda kv: kv[1]):
+        print(f"[04]   {name:22s} F1={f1:.4f}")
+    if result["excluded_classes"]:
+        print(f"[04] Minimum-count classes left to few-shot registration: "
+              f"{result['excluded_classes']} (docs/06_TRAINING.md sec 4.3)")
 
     # Log cache stats
     for name, src in [("train", train_source), ("val", val_source)]:
@@ -252,14 +279,17 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     # and analyses see genuine training state.
     save_checkpoint(ckpt_path, model, result["optimizer"], epoch=len(result["history"]),
                     extra={"best_epoch": result["best_epoch"],
-                           "best_val_acc": result["best_val_acc"]})
+                           "best_val_macro_f1": result["best_val_macro_f1"],
+                           "excluded_classes": result["excluded_classes"]})
     with open(run_dir / "stage1_history.json", "w") as f:
         json.dump(result["history"], f, indent=2)
     print(f"[04] Saved checkpoint to {ckpt_path}")
 
     registry.register(
         run_id, dataset=dataset, protocol=cfg.data.protocol, model="argus_stage1",
-        metrics={"best_val_acc": result["best_val_acc"], "best_epoch": result["best_epoch"],
+        metrics={"best_val_macro_f1": result["best_val_macro_f1"],
+                 "best_val_per_class_f1": result["best_val_per_class_f1"],
+                 "best_epoch": result["best_epoch"],
                  "epochs_run": len(result["history"])},
     )
     print(f"[04] Registered run '{run_id}' in registry.jsonl")

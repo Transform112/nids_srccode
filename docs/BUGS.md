@@ -905,6 +905,142 @@ not leaking across shuffled boundaries. Full suite: 118 passed.
 
 ---
 
+## Session 2026-07-27, part 5 — class imbalance: four specified mechanisms, none implemented
+
+Prompted by a direct question: *what has been done about the imbalance and the
+disproportional split?* Two separate things, and they have opposite answers.
+
+### The split is fine; the data is not
+
+`protocol_a_split` is a **per-class stratified temporal split** — it groups by
+label, sorts each class by time, then takes 70/15/15 *within each class*. So
+every class appears in every split at its population rate. Verified on the real
+Protocol-A artifacts: train/val/test class proportions agree to within 0.0003
+percentage points on all 15 classes. Nothing to fix, and `test_class_balance.py`
+now pins it so a future change to the splitter cannot silently break it.
+
+What is extreme is the underlying distribution. Training split, 1,741,204 rows:
+
+| class | rows | share |
+|---|---:|---:|
+| ddos_hoic | 476,204 | 27.35% |
+| benign | 463,428 | 26.62% |
+| brute_ftp | 185,850 | 10.67% |
+| … | | |
+| brute_web | 1,132 | 0.065% |
+| sql_injection | 308 | 0.018% |
+| brute_xss | 14 | 0.0008% |
+
+**34,014:1** between the largest and smallest class.
+
+### What was implemented for it: nothing
+
+docs/06_TRAINING.md §4 specifies three mechanisms "applied together", and §5
+specifies the early-stop metric. All four were absent from the code:
+
+| # | Specified | Was | Now |
+|---|---|---|---|
+| 50 | Effective-number class weights, `nu = 0.999` | `effective_number_nu` in config, read by nothing; `AMSoftmaxLoss` accepted `class_weights` and was never passed any | wired, `nu` retuned per measurement below |
+| 51 | Class-balanced target subsample, `n_per_class = 32` | `n_per_class` in config, read by nothing | implemented in the Stage-1 loss closure |
+| 52 | Early stop on **val macro-F1** | early-stopped on **accuracy**, labelled "macro-F1 proxy" | real macro-F1 from an accumulated confusion matrix |
+| 53 | Minimum-count guard below 100 rows | `min_count_for_prototype` in config, read by nothing | `brute_xss` (14 rows) excluded from the Stage-1 loss |
+
+\#52 is the one that mattered most, and it is the same failure as #49 seen from
+the metric side. A model that predicts only `ddos_hoic` and `benign` scores
+**0.54 accuracy and 0.10 macro-F1** on this split. Selecting on accuracy does
+not merely fail to notice tail collapse — it actively rewards it, since
+ignoring the six rarest classes costs 0.2 points of accuracy. Both the
+best-checkpoint copy and G1/G7 ran on that metric.
+
+### Measurement: capping does most of the work, and it inverts the ordering
+
+Measured on the real training split at the dataset's `anchor_bin_seconds = 10`,
+counting `min(count, 32)` per class per bin:
+
+| class | raw share | share after cap |
+|---|---:|---:|
+| ddos_hoic | 27.35% | **3.61%** |
+| benign | 26.62% | 17.28% |
+| infiltration | 7.56% | **30.82%** |
+| bot | 5.12% | 22.04% |
+| dos_hulk | 4.02% | 0.85% |
+
+`ddos_hoic` is a burst — half a million flows inside a few dense bins, so the
+cap crushes it 7.6x. `infiltration` is low-and-slow, spread thin across many
+bins, so the cap barely touches it and its *share* quadruples. Capping alone
+takes the imbalance from 1546:1 to **175:1** (excluding the min-count class),
+and shrinks an epoch's loss targets from 1.74M to 175K.
+
+Two consequences:
+
+1. The weights must be computed from the **post-cap** counts. Raw counts would
+   give `ddos_hoic` and `infiltration` near-identical weights when, after
+   capping, one is 8.5x more prevalent than the other — the correction would
+   point the wrong way. `effective_target_counts()` computes the post-cap
+   distribution exactly; script 04 passes it as `weight_counts`.
+2. `nu = 0.999` is close to inert here. The effective-number correction
+   saturates at `1/(1-nu)` samples, so `nu = 0.999` stops discriminating above
+   ~1,000 — while the post-cap classes run from 53,687 down to 308. Measured,
+   it gives every class from `dos_goldeneye` upward an identical weight: a
+   **3.8x** total spread against a residual 175:1 imbalance.
+
+`nu = 0.999` is Cui et al.'s CIFAR-LT value, where `n_c` runs 5,000 down to 50.
+It was carried into the design without rescaling to this dataset. Set to
+`nu = 0.9999` for cicids2018 only (`config/dataset/cicids2018.yaml`, with the
+justification inline): saturation at ~10,000, a **32.8x** spread — a real but
+bounded correction, well short of the 175x that full inverse-frequency
+weighting would apply to 308 `sql_injection` rows. Revert with
+`--set loss.effective_number_nu=0.999`.
+
+**Net effect of #50 + #51 + #53 together**, as effective gradient share:
+
+| | before | after |
+|---|---:|---:|
+| largest class | 27.35% (ddos_hoic) | 20.37% (infiltration) |
+| smallest trained class | 0.018% (sql_injection) | 3.84% (sql_injection) |
+| ratio | **1546:1** | **5.3:1** |
+
+Every trained class now receives at least 3.8% of the gradient. No row is ever
+duplicated — capping only ever removes from the head, per
+docs/06_TRAINING.md §4's explicit instruction not to oversample.
+
+### New gate G8 — tail collapse
+
+The blind spot noted at the end of #49, now closed. G0 trains on a
+*class-balanced* 938-flow subset, so a model that has stopped predicting the
+tail entirely still memorises that subset and passes at 0.99 — which is exactly
+what happened across three 12-hour runs. Aggregate metrics cannot catch it
+either. **G8 fails if any trained class scores F1 = 0 on the selected epoch's
+validation pass** (`gates.g8_max_collapsed_classes`, default 0). Minimum-count
+classes are excluded, since they are deliberately untrained. `test_class_balance.py`
+asserts G0 and G8 disagree on the same tail-blind model — that disagreement is
+the reason G8 exists.
+
+### Scope notes
+
+- The `brute_xss` guard keeps the class in the vocabulary and in the prototype
+  bank, and only removes it from the loss. Dropping it from the vocabulary
+  would shift every label id and invalidate the 908 MB prebuilt graph cache.
+  Its column stays available for few-shot registration (script 08), which is
+  what §4.3 asks for.
+- Stage 2 now also selects on macro-F1. docs/06_TRAINING.md §5 specifies val
+  OpenAUC there; that needs the open-set eval path and remains a disclosed
+  deviation, but macro-F1 is strictly closer to it than accuracy was.
+- `batch_anchor_bins = 64` remains unimplemented — the loop is still one bin at
+  a time. With chunk shuffling (#49) and per-bin class balancing (#51) in
+  place, its remaining value is gradient-noise reduction, not class balance.
+
+**Verified:** `tests/test_class_balance.py` — 36 tests covering the closed-form
+weights against hand-computed values, saturation behaviour and the absence of
+underflow at `nu ** 476204`, monotonicity in class count, the head-capped /
+tail-whole subsample with no duplication, the post-cap count inversion,
+macro-F1 vs accuracy on the real class histogram, and G8 including its
+disagreement with G0. Plus an end-to-end `train_stage1` test asserting the
+guard fires, the excluded class is absent from macro-F1, and G8 is recorded.
+Full suite: **155 passed**.
+
+---
+
 ## Decisions needed (updated after part 3)
 
 Every item from the original "Decisions needed" list is now RESOLVED

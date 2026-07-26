@@ -97,7 +97,7 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     print(f"[05] Training Stage 2 on {device} ...")
     result = train_stage2(model, train_source, val_source, cfg, device, max_bins=max_bins,
                           run_dir=run_dir, resume=resume)
-    print(f"[05] Stage 2 best val accuracy proxy: {result['best_val_acc']:.4f}")
+    print(f"[05] Stage 2 best val macro-F1: {result['best_val_macro_f1']:.4f}")
 
     thresholds = calibrate_thresholds(
         model, val_source, device,
@@ -110,7 +110,7 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     save_checkpoint(
         ckpt_path, model, result["optimizer"], epoch=len(result["history"]),
         extra={"thresholds": thresholds, "best_epoch": result["best_epoch"],
-               "best_val_acc": result["best_val_acc"]},
+               "best_val_macro_f1": result["best_val_macro_f1"]},
     )
     with open(run_dir / "stage2_history.json", "w") as f:
         json.dump(result["history"], f, indent=2)
@@ -120,7 +120,7 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
 
     registry.register(
         run_id, dataset=dataset, protocol=cfg.data.protocol, model="argus_stage2",
-        metrics={"best_val_acc": result["best_val_acc"], "best_epoch": result["best_epoch"],
+        metrics={"best_val_macro_f1": result["best_val_macro_f1"], "best_epoch": result["best_epoch"],
                  "epochs_run": len(result["history"]), "thresholds": thresholds},
     )
     print(f"[05] Registered run '{run_id}' in registry.jsonl")

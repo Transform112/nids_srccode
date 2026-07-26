@@ -62,6 +62,35 @@ def gate_g7_overfitting(train_f1: float, val_f1: float, max_gap: float = 0.10) -
     return passed, f"G7 overfitting: train-val gap={gap:.4f} (max {max_gap})"
 
 
+def gate_g8_tail_collapse(
+    per_class_f1: dict[str, float],
+    max_collapsed: int = 0,
+    min_f1: float = 0.0,
+) -> tuple[bool, str]:
+    """Fail when any trained class scores at or below `min_f1` on validation.
+
+    G0 cannot catch this: it trains on a *class-balanced* subset, so a model
+    that has stopped predicting the tail entirely still memorises that subset
+    and passes at 0.99. Three consecutive 12-hour runs shipped a near-constant
+    single-class predictor with every capacity gate green (docs/BUGS.md #49).
+
+    Aggregate metrics cannot catch it either — on this split, ignoring the six
+    rarest classes costs 0.2 points of accuracy. Only a per-class floor makes
+    the failure visible, which is what this gate is.
+
+    `per_class_f1` should exclude minimum-count classes: those are deliberately
+    not trained in Stage 1 (docs/06_TRAINING.md §4.3), so scoring them here
+    would fail the gate by design.
+    """
+    collapsed = sorted(name for name, f1 in per_class_f1.items() if f1 <= min_f1)
+    passed = len(collapsed) <= max_collapsed
+    detail = f" [{', '.join(collapsed)}]" if collapsed else ""
+    return passed, (
+        f"G8 tail collapse: {len(collapsed)}/{len(per_class_f1)} trained classes "
+        f"at F1<={min_f1:g}{detail} (max {max_collapsed})"
+    )
+
+
 def record_gate(report_path: str | Path | None, name: str, passed: bool, message: str) -> None:
     """Print a gate result and append it to `gates_report.json` (if a path is given)."""
     status = "PASS" if passed else "FAIL"

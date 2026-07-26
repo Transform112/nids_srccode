@@ -151,6 +151,9 @@ gates:
   g4_min_unknown_vacuity: 0.5
   g5_max_channel_ratio: 0.8
   g7_max_train_val_gap: 0.10
+  # G8: no trained class may collapse to F1=0 on validation. G0 is blind to
+  # this — it trains on a class-balanced subset (docs/BUGS.md #49).
+  g8_max_collapsed_classes: 0
   monitor_every_steps: 100
 
 eval:

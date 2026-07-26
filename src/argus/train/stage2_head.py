@@ -112,7 +112,9 @@ def evaluate_vacuity(
 def make_stage2_loss_fn(evid_loss: EvidentialLoss, cfg, epoch: int):
     kl_weight = min(1.0, epoch / max(cfg.loss.kl_anneal_epochs, 1)) * cfg.loss.lambda_kl_max
 
-    def loss_fn(outputs: dict, targets: torch.Tensor, model: ArgusModel) -> tuple[torch.Tensor, int]:
+    def loss_fn(
+        outputs: dict, targets: torch.Tensor, model: ArgusModel
+    ) -> tuple[torch.Tensor, int, torch.Tensor]:
         head = model.head
         alpha = outputs["alpha"]
         loss = evid_loss(alpha, targets, kl_anneal_weight=kl_weight)
@@ -136,7 +138,7 @@ def make_stage2_loss_fn(evid_loss: EvidentialLoss, cfg, epoch: int):
 
         pred = outputs["p_hat"].argmax(dim=1)
         correct = int((pred == targets).sum().item())
-        return loss, correct
+        return loss, correct, pred
 
     return loss_fn
 
@@ -216,7 +218,9 @@ def train_stage2(
         )
         history.append(
             {"epoch": epoch, "train_loss": train_result.loss, "train_acc": train_result.accuracy,
-             "val_loss": val_result.loss, "val_acc": val_result.accuracy}
+             "train_macro_f1": train_result.macro_f1,
+             "val_loss": val_result.loss, "val_acc": val_result.accuracy,
+             "val_macro_f1": val_result.macro_f1}
         )
 
         gates_report = run_dir / "gates_report.json" if run_dir is not None else None
@@ -225,14 +229,19 @@ def train_stage2(
             record_gate(gates_report, "G6", g6_ok, g6_msg + f" (stage2 epoch {epoch})")
             raise RuntimeError(f"Gate G6 failed at stage2 epoch {epoch}: non-finite training loss")
 
-        improved = val_result.accuracy > best_val
+        # Selection on macro-F1. docs/06_TRAINING.md §5 specifies val OpenAUC
+        # for Stage 2; that needs the open-set eval path and remains a
+        # disclosed deviation, but macro-F1 is strictly closer to it than
+        # accuracy — accuracy on this split is ~54% for a two-class predictor.
+        improved = val_result.macro_f1 > best_val
         print(f"[05] Epoch {epoch:2d}/{cfg.train.stage2_epochs}  "
               f"train={train_result.loss:.4f}  val={val_result.loss:.4f}  "
-              f"acc={val_result.accuracy:.4f}  tau={model.head.tau.item():.3f}  "
+              f"macroF1={val_result.macro_f1:.4f}  acc={val_result.accuracy:.4f}  "
+              f"tau={model.head.tau.item():.3f}  "
               f"{'NEW BEST' if improved else f'patience={patience_left}'}",
               flush=True)
         if improved:
-            best_val = val_result.accuracy
+            best_val = val_result.macro_f1
             best_epoch = epoch
             patience_left = cfg.train.stage2_patience
             if ckpt_best is not None:
@@ -250,19 +259,19 @@ def train_stage2(
             )
 
         if patience_left <= 0:
-            print(f"[05] Early stop at epoch {epoch} — val_acc={best_val:.4f}")
+            print(f"[05] Early stop at epoch {epoch} — val_macro_f1={best_val:.4f}")
             break
 
     if ckpt_best is not None and ckpt_best.exists() and best_epoch >= 0:
         state = torch.load(ckpt_best, map_location=str(device), weights_only=False)
         model.load_state_dict(state["model_state"])
-        print(f"[05] Restored best weights (epoch {best_epoch}, val_acc={best_val:.4f})")
+        print(f"[05] Restored best weights (epoch {best_epoch}, val_macro_f1={best_val:.4f})")
 
     # Post-training evidential gates G3/G4 (docs/06_TRAINING.md §8). Only
     # meaningful for the evidential head — the distance_threshold fallback has
     # no evidence/vacuity path to gate.
     if not hasattr(model.head, "log_evidence_clamp"):
-        return {"history": history, "best_val_acc": best_val, "best_epoch": best_epoch,
+        return {"history": history, "best_val_macro_f1": best_val, "best_epoch": best_epoch,
                 "optimizer": optimizer}
     gates_report = run_dir / "gates_report.json" if run_dir is not None else None
     mean_known_vac, mean_synth_vac = evaluate_vacuity(model, val_source, cfg, device,
@@ -274,5 +283,5 @@ def train_stage2(
         mean_synth_vac, getattr(cfg.gates, "g4_min_unknown_vacuity", 0.5))
     record_gate(gates_report, "G4", g4_ok, g4_msg)
 
-    return {"history": history, "best_val_acc": best_val, "best_epoch": best_epoch,
+    return {"history": history, "best_val_macro_f1": best_val, "best_epoch": best_epoch,
             "optimizer": optimizer}

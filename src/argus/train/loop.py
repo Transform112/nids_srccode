@@ -13,6 +13,7 @@ mutated in place while a graph that references it is still pending backward.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -27,10 +28,53 @@ class EpochResult:
     n_batches: int
     n_targets: int
     correct: int = 0
+    #: [C, C] int64 counts, rows = true class, cols = predicted class. Present
+    #: whenever the loss function returned predictions (see `run_epoch`).
+    confusion: torch.Tensor | None = None
+    #: Class ids excluded from `macro_f1` — the minimum-count classes that
+    #: Stage 1 does not train (docs/06_TRAINING.md §4.3). They stay in
+    #: `confusion` so they remain visible; they just do not steer selection.
+    metric_ignore_class_ids: tuple[int, ...] = ()
 
     @property
     def accuracy(self) -> float:
         return self.correct / self.n_targets if self.n_targets else 0.0
+
+    @property
+    def per_class_f1(self) -> dict[int, float]:
+        """F1 per class id, over classes with non-zero support in this pass."""
+        if self.confusion is None:
+            return {}
+        cm = self.confusion.to(torch.float64)
+        tp = cm.diagonal()
+        support = cm.sum(dim=1)
+        predicted = cm.sum(dim=0)
+        denom = 2 * tp + (predicted - tp) + (support - tp)
+        f1 = torch.where(denom > 0, 2 * tp / denom, torch.zeros_like(denom))
+        return {
+            i: float(f1[i]) for i in range(cm.shape[0])
+            if support[i] > 0 and i not in self.metric_ignore_class_ids
+        }
+
+    @property
+    def macro_f1(self) -> float:
+        """Unweighted mean F1 over classes present in this pass.
+
+        This — not `accuracy` — is the metric docs/06_TRAINING.md §5 specifies
+        for early stopping, and the difference is not cosmetic on a 34,014:1
+        split: a model that predicts only `ddos_hoic` and `benign` scores 0.54
+        accuracy and 0.09 macro-F1. Selecting on accuracy actively rewards
+        ignoring the tail (docs/BUGS.md #52).
+
+        Classes with no support in this pass are skipped rather than scored 0,
+        so the number does not depend on how a rare class happened to fall
+        across bins. False positives *onto* an absent class still register, via
+        the precision of the classes they were taken from.
+        """
+        per_class = self.per_class_f1
+        if not per_class:
+            return 0.0
+        return sum(per_class.values()) / len(per_class)
 
 
 def model_inputs_from_batch(batch: dict, device: torch.device) -> tuple:
@@ -69,12 +113,23 @@ def run_epoch(
     label: str = "",
     log_every_bins: int = 50,
     shuffle_chunks: bool = True,
+    num_classes: int | None = None,
+    metric_ignore_class_ids: Sequence[int] = (),
 ) -> EpochResult:
     """Run one epoch (or eval pass) over all anchor bins in `source`.
 
-    `loss_fn(outputs, targets, model) -> (loss_tensor, correct_count)` computes
-    the stage-specific loss and returns the number of correctly classified
-    targets for accuracy tracking.
+    `loss_fn(outputs, targets, model)` computes the stage-specific loss and
+    returns `(loss_tensor, correct_count)`, optionally with a third element:
+    the [B] predicted class ids. When predictions are returned, a full
+    confusion matrix is accumulated and `EpochResult.macro_f1` becomes
+    available — which is the metric training actually selects on
+    (docs/06_TRAINING.md §5). Two-element returns still work; they just leave
+    `EpochResult.confusion` at None.
+
+    `num_classes` sizes that confusion matrix; it defaults to
+    `model.num_classes`. `metric_ignore_class_ids` are excluded from macro-F1
+    (not from the matrix) — the minimum-count classes Stage 1 leaves to
+    few-shot registration would otherwise contribute a constant 0.
 
     `channel_penalty`, if given, is a dict with keys `module` (a
     `ChannelPenaltyLoss` instance), `lambda_ch`, `stride`, `a_idx`, `b_idx`.
@@ -120,6 +175,11 @@ def run_epoch(
     n_targets = 0
     correct = 0
     memory_state = memory_state if memory_state is not None else {}
+
+    n_cls = num_classes if num_classes is not None else getattr(model, "num_classes", None)
+    confusion = (
+        torch.zeros(n_cls, n_cls, dtype=torch.long, device=device) if n_cls else None
+    )
 
     chunk_loss: torch.Tensor | None = None
     chunk_bins = 0
@@ -177,7 +237,9 @@ def run_epoch(
 
             with torch.set_grad_enabled(train):
                 outputs = model(*inputs, memory=memory_state, node_ids=node_ids)
-                loss, n_correct = loss_fn(outputs, targets, model)
+                returned = loss_fn(outputs, targets, model)
+                loss, n_correct = returned[0], returned[1]
+                preds = returned[2] if len(returned) > 2 else None
                 if apply_penalty:
                     penalty = channel_penalty["module"](
                         loss, target_edge_attr,
@@ -194,12 +256,34 @@ def run_epoch(
             n_targets += len(targets)
             correct += n_correct
 
+            if preds is not None and confusion is not None:
+                with torch.no_grad():
+                    t = targets.reshape(-1)
+                    p = preds.reshape(-1).to(t.device)
+                    # A label outside the vocabulary means the cache and the
+                    # class vocab disagree — count it nowhere rather than
+                    # letting bincount silently overflow into another cell.
+                    ok = (t >= 0) & (t < n_cls) & (p >= 0) & (p < n_cls)
+                    if bool(ok.any()):
+                        flat = torch.bincount(
+                            (t[ok] * n_cls + p[ok]).to(torch.long), minlength=n_cls * n_cls
+                        )
+                        confusion += flat.view(n_cls, n_cls).to(confusion.device)
+
             if (i + 1) % log_every_bins == 0:
                 pct = (i + 1) / total * 100
                 avg_loss = total_loss / n_batches
                 acc = correct / n_targets if n_targets else 0.0
+                # Running macro-F1 alongside accuracy: on this split the two
+                # diverge hard, and accuracy alone hid a total tail collapse
+                # for three runs (docs/BUGS.md #49, #52).
+                f1_str = ""
+                if confusion is not None:
+                    running = EpochResult(0.0, 0, 0, confusion=confusion.cpu(),
+                                          metric_ignore_class_ids=tuple(metric_ignore_class_ids))
+                    f1_str = f"  macroF1={running.macro_f1:.4f}"
                 print(f"  {prefix}{mode_str} {i + 1}/{total} bins ({pct:.0f}%)  "
-                      f"loss={avg_loss:.4f}  acc={acc:.4f}", flush=True)
+                      f"loss={avg_loss:.4f}  acc={acc:.4f}{f1_str}", flush=True)
 
         # Step at the chunk boundary — driven by the chunk structure itself, so
         # a chunk whose trailing bins were empty still steps on what it did see.
@@ -209,4 +293,11 @@ def run_epoch(
     if train and optimizer is not None:
         _chunk_step()
 
-    return EpochResult(loss=total_loss / max(n_batches, 1), n_batches=n_batches, n_targets=n_targets, correct=correct)
+    return EpochResult(
+        loss=total_loss / max(n_batches, 1),
+        n_batches=n_batches,
+        n_targets=n_targets,
+        correct=correct,
+        confusion=confusion.cpu() if confusion is not None else None,
+        metric_ignore_class_ids=tuple(int(c) for c in metric_ignore_class_ids),
+    )

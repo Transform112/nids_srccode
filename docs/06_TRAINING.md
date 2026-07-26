@@ -253,6 +253,33 @@ rarest attack class has 158 samples. Three mechanisms, applied together:
 Do **not** oversample rare classes by duplication — with `n_c = 158` this
 memorises rather than generalises.
 
+### 4.4 Implementation notes (measured on CICIDS2018)
+
+The three mechanisms interact, and on this dataset the interaction is large
+enough to change what the weights should be computed from.
+
+- **Capping is per anchor bin**, so its effect depends on how a class is
+  distributed in *time*, not just how many rows it has. At
+  `anchor_bin_seconds = 10` and `n_per_class = 32`, `ddos_hoic` (a burst: half
+  a million flows in a few dense bins) falls from 27.35% to 3.61% of loss
+  targets, while `infiltration` (low and slow, spread thin) *rises* from 7.56%
+  to 30.82%. Capping alone takes the imbalance from 1546:1 to 175:1.
+- **Weights are therefore computed from the post-cap counts**
+  (`losses.class_balance.effective_target_counts`), not the raw ones. Raw
+  counts would give `ddos_hoic` and `infiltration` near-identical weights when
+  the loss actually sees one 8.5× more often than the other.
+- **`ν` is dataset-scaled.** The effective-number correction saturates at
+  `1/(1−ν)` samples, so `ν = 0.999` — Cui et al.'s CIFAR-LT value, where `n_c`
+  runs 5,000 down to 50 — stops discriminating above ~1,000 while this split's
+  post-cap classes run from 53,687 down to 308. Measured, it produces a 3.8×
+  total spread against a 175:1 residual imbalance. CICIDS2018 therefore
+  overrides `effective_number_nu = 0.9999` (32.8× spread), still well short of
+  the 175× that inverse-frequency weighting would apply to 308 rows.
+
+Net effect of all three, as share of the gradient: from **1546:1** between the
+largest and smallest trained class to **5.3:1**, with every trained class
+receiving at least 3.8%.
+
 ---
 
 ## 5. Optimisation
@@ -267,7 +294,7 @@ memorises rather than generalises.
 | Batch (anchor bins) | 64 | 64 |
 | BPTT chunk | 8 bins | 8 bins |
 | Epochs | 30 (early stop, patience 5) | 10 (patience 3) |
-| Early-stop metric | val macro-F1 (nearest prototype) | val OpenAUC |
+| Early-stop metric | val macro-F1 (nearest prototype) | val OpenAUC (implemented: val macro-F1) |
 | Precision | AMP bf16 (fp16 if unsupported) | AMP bf16 |
 | Seeds | 5 seeds: 0, 1, 2, 3, 4 | inherit Stage-1 seed |
 
@@ -371,6 +398,17 @@ changes. It takes minutes.
 | G5 | Channel ratio `r` > 0.8 sustained | Relying on forgeable features | Raise `λ_ch` |
 | G6 | Any NaN/Inf in loss | Numerical failure | Halt, dump batch. **Check the evidence expression first** (`05_ARCHITECTURE.md` §6.3) |
 | G7 | Train − val macro-F1 gap > 0.10 for 3 epochs | Overfitting | Raise dropout/DropEdge; check identity leakage |
+| G8 | Any trained class at val F1 = 0 on the selected epoch | Tail collapse | Halt; check target ordering and class balancing (`BUGS.md` #49/#52) |
+
+
+**Why G8 is not redundant with G0 or G1.** G0 trains on a *class-balanced*
+subset, so a model that has stopped predicting the tail entirely still
+memorises that subset and passes at 0.99. G1 and G7 are aggregates, and on
+CICIDS2018 ignoring the six rarest classes costs 0.2 points of accuracy and
+little macro-F1 movement early on. Only a per-class floor makes the failure
+visible — three consecutive 12-hour runs shipped a near-constant single-class
+predictor with every other gate green. Minimum-count classes (§4.3) are excluded
+from G8, since they are deliberately not trained.
 
 ### 8.3 Gradient-health monitors (every 100 steps)
 

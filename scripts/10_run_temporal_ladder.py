@@ -156,12 +156,13 @@ def run_one_rung(
     class_counts = train_feat["canonical_label"].value_counts().to_dict()
     model = ArgusModel(cfg, f_e=len(feature_names), f_v=18, class_names=class_names, class_counts=class_counts).to(device)
 
-    result = train_stage1(model, train_source, val_source, cfg, device, max_bins=max_bins)
+    result = train_stage1(model, train_source, val_source, cfg, device, max_bins=max_bins,
+                          class_counts=class_counts)
     report = _evaluate_per_class(model, val_source, device, class_names, max_bins=max_bins)
 
     return {
         "rung": rung, "seed": seed, "f_e": len(feature_names),
-        "best_val_acc": result["best_val_acc"], "history": result["history"],
+        "best_val_macro_f1": result["best_val_macro_f1"], "history": result["history"],
         "macro_f1": report["macro_f1"] if report else None,
         "per_class_f1": report["per_class_f1"] if report else None,
     }
@@ -191,7 +192,7 @@ def run(
         for seed in seeds:
             print(f"[10] Rung {rung}, seed {seed} ...")
             r = run_one_rung(rung, dataset, seed, train_df, val_df, class_names, epochs, max_bins)
-            print(f"[10]   F_e={r['f_e']}, val_acc={r['best_val_acc']:.4f}, macro_f1={r['macro_f1']}")
+            print(f"[10]   F_e={r['f_e']}, val_macro_f1={r['best_val_macro_f1']:.4f}, test_macro_f1={r['macro_f1']}")
             results.append(r)
 
     out_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_temporal_ladder"

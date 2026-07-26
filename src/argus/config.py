@@ -92,7 +92,7 @@ SECTION_SCHEMA: dict[str, set[str]] = {
         "g0_capacity_check", "g0_subset_size", "g0_required_train_acc",
         "g1_min_val_f1_epoch5", "g2_max_proto_cosine", "g3_max_known_vacuity",
         "g4_min_unknown_vacuity", "g5_max_channel_ratio", "g7_max_train_val_gap",
-        "monitor_every_steps",
+        "g8_max_collapsed_classes", "monitor_every_steps",
     },
     "eval": {
         "metrics_seeds", "bootstrap_resamples", "ece_bins", "ece_binning",
