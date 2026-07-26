@@ -100,9 +100,12 @@ class PrototypeBank(nn.Module):
                 continue
             protos = self.bank[mask]
             sim = torch.matmul(protos, protos.T)
-            # Zero diagonal
-            sim = sim - torch.eye(sim.shape[0], device=sim.device)
-            loss = loss + F.relu(sim - max_cosine).pow(2).sum()
+            # Each unordered pair (i<j) counted once — the full matrix is
+            # symmetric, so summing it whole (even with the diagonal zeroed)
+            # silently doubles the effective lambda_div.
+            n = sim.shape[0]
+            upper = torch.triu(torch.ones(n, n, dtype=torch.bool, device=sim.device), diagonal=1)
+            loss = loss + F.relu(sim[upper] - max_cosine).pow(2).sum()
         return loss
 
     def register_class(

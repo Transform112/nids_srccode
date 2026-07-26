@@ -3,6 +3,7 @@
 data:
   dataset: bot_iot
   node_granularity: ip_port
+  subsample_target: 1000000  # docs/02_DATASETS.md §5.3 override table
 graph:
   node_granularity: ip_port
 

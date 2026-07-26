@@ -110,9 +110,6 @@ class OpenMax:
                     w_score = 0.0
                 recal[c] = v[c] * (1.0 - w_score)
 
-            # Unknown pseudo-logit
-            recal_alpha = v[alpha_cls]
-            recal[alpha_cls] = recal_alpha * (1.0 - w_score)
             # Simple heuristic: unknown score is weighted sum of tail
             scores[i] = 1.0 - np.max(_softmax(recal))
         return scores

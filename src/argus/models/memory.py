@@ -45,7 +45,15 @@ class NodeMemory(nn.Module):
         """
         device = inputs.device
         ids_cpu = node_ids.detach().cpu().tolist()
-        hid = torch.stack([state.get(i, torch.zeros(self.d_h, device=device)) for i in ids_cpu])
+        # Deliberately NOT detached: within a BPTT chunk, gradient flows from
+        # later bins' losses back through this recurrence into the GRU's own
+        # weights and earlier bins' encoders. Truncation happens at chunk
+        # boundaries only — train/loop.py::run_epoch detaches every stored
+        # state right after each chunk's single backward()+step() call
+        # (docs/05_ARCHITECTURE.md §4, T_bptt = 8 bins).
+        hid = torch.stack(
+            [state.get(i, torch.zeros(self.d_h, device=device)) for i in ids_cpu]
+        )
         if self._drop is not None and self.training:
             # Memory dropout: zero a node's memory with probability p_mem.
             mask = torch.bernoulli(torch.full((hid.shape[0], 1), 1.0 - self.dropout, device=device))

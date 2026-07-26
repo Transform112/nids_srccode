@@ -70,7 +70,8 @@ def load_numpy(path: str | Path) -> np.ndarray:
     return np.load(path)
 
 
-def resolve_class_vocab(cfg: Any, dataset: str, artifact_dir: Path) -> Path:
+def resolve_class_vocab(cfg: Any, dataset: str, artifact_dir: Path,
+                        holdout_index: int | None = None) -> Path:
     """Resolve class_vocab.json, preferring the Stage-1 run directory.
 
     On Kaggle the artifact directory (input mount) is read-only, so
@@ -81,14 +82,18 @@ def resolve_class_vocab(cfg: Any, dataset: str, artifact_dir: Path) -> Path:
     Args:
         cfg: resolved OmegaConf config.
         dataset: dataset name (e.g. ``"cicids2018"``).
-        artifact_dir: ``resolved_path(cfg, "artifact_dir") / dataset``.
+        artifact_dir: ``resolved_path(cfg, "artifact_dir") / dataset`` (already
+            holdout-suffixed by the caller for Protocol-B runs).
+        holdout_index: Protocol-B holdout index, if any — selects the
+            matching ``<dataset>_stage1_b<i>`` run directory.
 
     Returns:
         Path to the class_vocab.json file that exists.
     """
     from pathlib import Path
 
-    stage1_dir = Path(__file__).parents[2] / cfg.run.out_dir / f"{dataset}_stage1"
+    suffix = run_suffix(holdout_index)
+    stage1_dir = Path(__file__).parents[3] / cfg.run.out_dir / f"{dataset}_stage1{suffix}"
     run_copy = stage1_dir / "class_vocab.json"
     artifact_copy = artifact_dir / "class_vocab.json"
 
@@ -100,3 +105,33 @@ def resolve_class_vocab(cfg: Any, dataset: str, artifact_dir: Path) -> Path:
         f"class_vocab.json not found in {stage1_dir} or {artifact_dir}. "
         f"Run scripts/04_train_encoder.py first."
     )
+
+
+def holdout_subdir(base: Path, holdout_index: int | None) -> Path:
+    """Per-holdout data/artifact subdirectory for Protocol-B runs.
+
+    Protocol-B open-set evaluation requires 5 genuinely holdout-excluded
+    training runs (docs/02_DATASETS.md §4.1); each gets its own splits,
+    feature pipeline, cache, and checkpoints under ``holdout_b<i>/`` so they
+    never clobber the Protocol-A closed-set pipeline or each other.
+    """
+    return base if holdout_index is None else base / f"holdout_b{holdout_index}"
+
+
+def run_suffix(holdout_index: int | None) -> str:
+    """Run-directory / run-id suffix for Protocol-B holdout runs ("_b<i>")."""
+    return "" if holdout_index is None else f"_b{holdout_index}"
+
+
+def derive_class_vocab(train_df: pd.DataFrame) -> list[str]:
+    """Derive the canonical class vocabulary directly from train-split labels.
+
+    This is the single source of truth for label->id ordering. Scripts
+    03_cache_graphs.py and 04_train_encoder.py must both call this (rather
+    than one reading a persisted class_vocab.json) because 03 runs *before*
+    04 writes that file in the intended Kaggle workflow — a CPU-only
+    cache-building session ahead of the GPU training session. Deriving
+    fresh from the same train_features.parquet guarantees identical label
+    ids regardless of run order.
+    """
+    return sorted(train_df["canonical_label"].unique().tolist())

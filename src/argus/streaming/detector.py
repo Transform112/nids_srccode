@@ -104,9 +104,9 @@ class StreamingDetector:
         )
         current_bin = source.bin_ids[-1]
         batch = source.build_bin_batch(int(current_bin), f_v=self.model.f_v)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         if batch is None or batch["n_targets"] == 0:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             return [
                 Verdict("UNKNOWN", None, 0.0, 1.0, elapsed_ms / max(len(times_ms), 1))
                 for _ in range(len(times_ms))
@@ -118,6 +118,10 @@ class StreamingDetector:
             decisions, _ = self.model.head.decide(outputs) if hasattr(self.model.head, "decide") else (
                 outputs["p_hat"].argmax(dim=1), None
             )
+
+        # Latency is measured end-to-end (graph build + forward pass), matching
+        # docs/08_EVALUATION.md §4.6 ("per-flow, from push() entry to verdict").
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         n_pushed = len(times_ms)
         n_targets = outputs["p_hat"].shape[0]

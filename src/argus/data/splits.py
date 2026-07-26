@@ -59,9 +59,14 @@ def protocol_b_split(
 
     known_splits = protocol_a_split(known_df, label_col, time_col, train_frac, val_frac)
     unknown_labelled = unknown_df.copy()
+    # Preserve the true class before relabelling: few-shot evaluation (T4)
+    # needs per-held-out-class identity, which "UNKNOWN" erases.
+    unknown_labelled["label_pre_holdout"] = unknown_labelled[label_col]
     unknown_labelled[label_col] = "UNKNOWN"
 
-    test = pd.concat([known_splits["test"], unknown_labelled], ignore_index=True)
+    known_test = known_splits["test"].copy()
+    known_test["label_pre_holdout"] = known_test[label_col]
+    test = pd.concat([known_test, unknown_labelled], ignore_index=True)
     test = test.sort_values(time_col).reset_index(drop=True)
 
     return {

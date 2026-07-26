@@ -1,14 +1,19 @@
 """Shared train/eval loop over anchor-bin graph batches.
 
-Processes one anchor bin at a time (see docs/04_GRAPH_CONSTRUCTION.md §5 for the
-full multi-bin BPTT batching spec; this loop carries the node-memory dict
-forward across bins and detaches it every `bptt_chunk` bins, which is the core
-of that spec applied one bin at a time).
+Processes anchor bins in truncated-BPTT chunks of `bptt_chunk` bins
+(docs/06_TRAINING.md §5, docs/05_ARCHITECTURE.md §4): per-bin losses are
+accumulated across a chunk and a single `backward()` + `optimizer.step()`
+runs at each chunk boundary, after which every tensor in `memory_state` is
+detached. Within a chunk the TE6 per-node GRU memory (docs/05_ARCHITECTURE.md
+§4) is read and written *without* detaching, so gradient genuinely flows
+back through the recurrence — the GRU's own weights are trained. Stepping
+once per chunk (not per bin) is what makes this safe: no parameter is
+mutated in place while a graph that references it is still pending backward.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -44,6 +49,11 @@ def model_inputs_from_batch(batch: dict, device: torch.device) -> tuple:
     )
 
 
+def _detach_memory(memory_state: dict) -> None:
+    for k in memory_state:
+        memory_state[k] = memory_state[k].detach()
+
+
 def run_epoch(
     source: AnchorBinGraphSource,
     model: ArgusModel,
@@ -70,13 +80,36 @@ def run_epoch(
     Applied every `stride`-th training batch, with `lambda_ch` scaled by
     `stride` to keep the expected penalty magnitude constant
     (docs/06_TRAINING.md §2.4).
+
+    In training mode, gradient steps happen once per `bptt_chunk` bins on the
+    mean of the chunk's per-bin losses; `memory_state` is detached at every
+    chunk boundary (truncated BPTT). In eval mode no graph is built at all.
     """
     model.train(train)
+    if hasattr(source, "reset_epoch_state"):
+        source.reset_epoch_state()
     total_loss = 0.0
     n_batches = 0
     n_targets = 0
     correct = 0
     memory_state = memory_state if memory_state is not None else {}
+
+    chunk_loss: torch.Tensor | None = None
+    chunk_bins = 0
+
+    def _chunk_step() -> None:
+        nonlocal chunk_loss, chunk_bins
+        if chunk_loss is None or optimizer is None:
+            return
+        optimizer.zero_grad()
+        (chunk_loss / chunk_bins).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        if hasattr(model.head, "prototype_bank"):
+            model.head.prototype_bank.post_step_normalize()
+        _detach_memory(memory_state)
+        chunk_loss = None
+        chunk_bins = 0
 
     bins = source.unique_bins[:max_bins] if max_bins else source.unique_bins
     total = len(bins)
@@ -94,9 +127,10 @@ def run_epoch(
         if apply_penalty:
             target_edge_attr.requires_grad_(True)
         targets = batch["target_labels"].to(device)
+        node_ids = batch["node_ids"].to(device)
 
         with torch.set_grad_enabled(train):
-            outputs = model(*inputs)
+            outputs = model(*inputs, memory=memory_state, node_ids=node_ids)
             loss, n_correct = loss_fn(outputs, targets, model)
             if apply_penalty:
                 penalty = channel_penalty["module"](
@@ -105,15 +139,10 @@ def run_epoch(
                 loss = loss + channel_penalty["stride"] * channel_penalty["lambda_ch"] * penalty
 
         if train and optimizer is not None:
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            if model.head.__class__.__name__ == "EPCHead":
-                model.head.prototype_bank.post_step_normalize()
-
-        if (i + 1) % bptt_chunk == 0:
-            memory_state.clear()  # detach: our loop doesn't carry raw tensors, so clear is safe
+            chunk_loss = loss if chunk_loss is None else chunk_loss + loss
+            chunk_bins += 1
+            if chunk_bins >= bptt_chunk:
+                _chunk_step()
 
         total_loss += float(loss.item())
         n_batches += 1
@@ -125,6 +154,9 @@ def run_epoch(
             avg_loss = total_loss / n_batches
             acc = correct / n_targets if n_targets else 0.0
             print(f"  {prefix}{mode_str} {i + 1}/{total} bins ({pct:.0f}%)  "
-                  f"loss={avg_loss:.4f}  acc={acc:.4f}")
+                  f"loss={avg_loss:.4f}  acc={acc:.4f}", flush=True)
+
+    if train and optimizer is not None:
+        _chunk_step()
 
     return EpochResult(loss=total_loss / max(n_batches, 1), n_batches=n_batches, n_targets=n_targets, correct=correct)

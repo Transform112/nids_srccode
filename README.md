@@ -89,18 +89,25 @@ These are recorded because violating them silently invalidates results.
 
 ## Status
 
-Specification complete and validated against the real data. **Implementation
-in progress**, spanning every phase P0–P8 at varying depth:
+Specification complete and validated against the real data. Every phase
+P0–P8 has a real, non-stub implementation; remaining work is running the
+full-scale sweeps on Kaggle and writing the paper. `docs/TODO.md` is the
+authoritative, actively-maintained checklist — this section is a summary of
+it, and may lag; when in doubt, trust `docs/TODO.md`.
 
 - **P0–P3** (repo scaffold, config system, data substrate, feature pipeline,
   graph construction incl. real node features + TE7 spectral descriptor,
-  SR-TEG encoder): complete and tested.
+  SR-TEG encoder): complete and tested. A local full-scale run of the real
+  20.1M-row CICIDS2018 CSV through the data substrate (all 15 classes) has
+  been executed successfully, including a precomputed graph-batch disk cache
+  (`scripts/03_cache_graphs.py`, `src/argus/graph/cache.py`) that replays
+  bins from disk instead of rebuilding them every epoch.
 - **P4** (EPC head, two-stage training, channel-penalty loss, validation-only
   threshold calibration): complete and tested.
 - **P2** (baselines): Extra Trees, Random Forest, MLP, identity-only leakage
-  floor, E-GraphSAGE, and EGATv2 (GATv2 attention + residual connections)
-  implemented and verified end-to-end/unit-tested; Anomal-E and post-hoc OSR
-  baselines not yet built.
+  floor, E-GraphSAGE, EGATv2, Anomal-E, and post-hoc OSR (OpenMax/energy/ODIN)
+  all implemented; tabular + identity-only + E-GraphSAGE verified end-to-end
+  on real data, the rest unit-tested.
 - **P5** (adversarial): all five attacks implemented and tested — domain-constraint
   projection, the headline A2 structural-injection attack (budget sweep, both
   spread strategies), A1 feature-space evasion and A4 adaptive white-box
@@ -110,15 +117,18 @@ in progress**, spanning every phase P0–P8 at varying depth:
   A5 temporal jitter with attacker-cost accounting. `scripts/11_run_adversarial.py`
   orchestrates all five; full-scale sweeps on real data not yet run.
 - **P6** (XAI): native evidence attribution (exact embedding-level
-  decomposition + Integrated Gradients feature attribution), both verified
-  against the completeness axiom; baseline explainers and UNKNOWN triage not
-  yet built.
-- **P7** (temporal ladder): not yet implemented.
+  decomposition + Integrated Gradients feature attribution, both verified
+  against the completeness axiom), baseline explainers (GNNExplainer,
+  PGExplainer, KernelSHAP, attention-only, counterfactual necessity), and
+  UNKNOWN-cluster triage all implemented and tested; not yet run on real data.
+- **P7** (temporal ladder): implemented (`scripts/10_run_temporal_ladder.py`,
+  `config/experiment/temporal_ladder.yaml`, 8 rungs × 5 seeds); not yet run.
 - **P8** (deployment): `StreamingDetector` (`push()` / `register_class()`)
-  implemented with no-lookahead and bounded-memory tests; aggregated
-  throughput/latency reporting not yet built.
+  with no-lookahead and bounded-memory tests, plus aggregated throughput/
+  latency/model-size reporting (`src/argus/eval/deployment.py`,
+  `scripts/13_measure_deployment.py`), implemented and tested.
 
-**77 tests passing** under `tests/`, plus an end-to-end laptop smoke test at
+**97 tests passing** under `tests/`, plus an end-to-end laptop smoke test at
 `scripts/00_smoke_test.py` that runs the full P1–P4 pipeline on a real slice of
 `dataset/NF-CICIDS2018-v3.csv`. See `docs/TODO.md` for the exact per-item
 checklist.
@@ -136,14 +146,17 @@ docstring for laptop vs. Kaggle-scale usage (the `--nrows`, `--set
 data.subsample_target=...`, and `--set run.device=cuda` overrides control
 scale; `--max-bins` bounds anchor-bin processing for quick dev runs).
 
-**Known limitation:** the current SR-TEG encoder computes per-node aggregation
-with a Python loop over nodes per layer (`src/argus/models/srteg.py`), which is
-correct but not yet vectorised for large graphs. On real timestamps spanning
-hours, the number of anchor bins (one per second by default) makes a full
-training epoch slow; `graph.anchor_bin_seconds`, `train.stage1_epochs`, and the
-`max_bins` argument to `train_stage1`/`train_stage2` can bound this for
-development. Full Kaggle-scale throughput work (vectorising the per-node loop,
-precomputed graph batch caching per `docs/12_IMPLEMENTATION_PLAN.md` §4.5) is
-the next milestone. The temporal ablation ladder (P7) and the remaining
-adversarial/XAI/baseline modules are the next scope to close — see
-`docs/TODO.md` for the itemised list.
+**Known limitation:** graph construction (not the encoder's per-node
+aggregation) is the throughput bottleneck — building one anchor bin takes a
+few seconds, and at the documented default `anchor_bin_seconds=1` a full
+CICIDS2018 epoch produces ~62,000 bins, which does not fit a single Kaggle
+GPU session. Two mitigations are in place: `scripts/03_cache_graphs.py`
+precomputes and gzip-compresses every bin once so later epochs replay from
+disk in ~50ms/bin instead of rebuilding (`src/argus/graph/cache.py` guards
+against silently reusing a cache built with different `graph.*` settings);
+and `config/dataset/cicids2018.yaml` coarsens `anchor_bin_seconds`/
+`window_short_seconds` to 10s as a compute-budget deviation from the
+documented `{1,5}`/`{0.5,1,2}` ranges (`docs/07_HYPERPARAMETERS.md` §3,
+tracked in `docs/TODO.md` "Open decisions"). Full Kaggle-scale training runs
+(P3 parity check, P4 Stage-1/2 training, then P5–P8 sweeps) are the next
+milestone — see `docs/TODO.md` for the itemised list.

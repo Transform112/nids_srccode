@@ -47,42 +47,38 @@ def main() -> None:
     print("\n--- Step 3: fit feature pipeline ---")
     fit_features.run(dataset)
 
+    # run.out_dir is isolated from the real results/runs/<dataset>_stage1/
+    # tree so a local smoke test never collides with a production Kaggle
+    # cache/checkpoint directory (different graph.* settings would otherwise
+    # trip the cache fingerprint guard in argus.graph.cache).
+    smoke_overrides = [
+        "run.device=cpu",
+        "run.out_dir=results/runs_smoketest",
+        "model.layers=1",
+        "model.d_h=32",
+        "model.d_A=12",
+        "model.d_B=20",
+        "model.d_z=16",
+        "graph.neighbour_cap=8",
+        "graph.window_mid_seconds=10",
+        "graph.window_long_seconds=60",
+    ]
+
     print("\n--- Step 4: Stage-1 encoder training (smoke config) ---")
     train_encoder.run(
         dataset,
-        overrides=[
-            "run.device=cpu",
-            "model.layers=1",
-            "model.d_h=32",
-            "model.d_A=12",
-            "model.d_B=20",
-            "model.d_z=16",
-            "graph.neighbour_cap=8",
-            "graph.window_mid_seconds=10",
-            "graph.window_long_seconds=60",
-            "train.stage1_epochs=1",
-            "train.stage1_patience=1",
-        ],
+        overrides=[*smoke_overrides, "train.stage1_epochs=1", "train.stage1_patience=1"],
         max_bins=30,
+        skip_gate0=True,  # G0 preflight is a production check, not a smoke-test step
+        force=True,       # smoke runs must never be skipped by an old registry entry
     )
 
     print("\n--- Step 5: Stage-2 evidential head training (smoke config) ---")
     train_head.run(
         dataset,
-        overrides=[
-            "run.device=cpu",
-            "model.layers=1",
-            "model.d_h=32",
-            "model.d_A=12",
-            "model.d_B=20",
-            "model.d_z=16",
-            "graph.neighbour_cap=8",
-            "graph.window_mid_seconds=10",
-            "graph.window_long_seconds=60",
-            "train.stage2_epochs=1",
-            "train.stage2_patience=1",
-        ],
+        overrides=[*smoke_overrides, "train.stage2_epochs=1", "train.stage2_patience=1"],
         max_bins=30,
+        force=True,
     )
 
     print("\n" + "=" * 70)

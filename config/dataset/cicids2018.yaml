@@ -5,6 +5,14 @@ data:
   node_granularity: ip
 graph:
   node_granularity: ip
+  # Coarsened from the docs/07_HYPERPARAMETERS.md default (1s/1s) to keep a
+  # single training epoch tractable on one Kaggle GPU session: 1s anchor bins
+  # produced 61,692 bins/epoch at ~4-5 sec/bin uncached (~82h/epoch). See
+  # docs/TODO.md "Open decisions". Must match the graph.* settings the
+  # precomputed cache in results/runs/cicids2018_stage1/cache/ was built
+  # with — argus.graph.cache.verify_or_write_cache_meta raises on mismatch.
+  anchor_bin_seconds: 10
+  window_short_seconds: 10
 
 classes:
   benign: Benign

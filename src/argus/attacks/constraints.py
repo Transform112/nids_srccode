@@ -10,6 +10,13 @@ import numpy as np
 import pandas as pd
 
 MIN_HEADER_BYTES = 40  # minimum IPv4+TCP header size
+MAX_PKT_BYTES = 1514  # standard Ethernet MTU + header
+
+NUM_PKTS_BIN_COLS = [
+    "NUM_PKTS_UP_TO_128_BYTES", "NUM_PKTS_128_TO_256_BYTES",
+    "NUM_PKTS_256_TO_512_BYTES", "NUM_PKTS_512_TO_1024_BYTES",
+    "NUM_PKTS_1024_TO_1514_BYTES",
+]
 
 
 def project(df: pd.DataFrame) -> pd.DataFrame:
@@ -40,10 +47,29 @@ def project(df: pd.DataFrame) -> pd.DataFrame:
                 df.loc[over, "DURATION_IN"] = df.loc[over, "DURATION_IN"] * scale[over]
                 df.loc[over, "DURATION_OUT"] = df.loc[over, "DURATION_OUT"] * scale[over]
 
+    if "IN_PKTS" in df.columns and "OUT_PKTS" in df.columns:
+        bin_cols = [c for c in NUM_PKTS_BIN_COLS if c in df.columns]
+        if bin_cols:
+            total_pkts = (df["IN_PKTS"] + df["OUT_PKTS"]).clip(lower=0)
+            bin_sum = df[bin_cols].clip(lower=0).sum(axis=1)
+            scale = (total_pkts / bin_sum.replace(0, np.nan)).fillna(0.0)
+            for c in bin_cols:
+                df[c] = (df[c].clip(lower=0) * scale).round()
+            # Every bin zero but a nonzero total: put it all in the smallest-size bin.
+            empty = (bin_sum == 0) & (total_pkts > 0)
+            if empty.any():
+                df.loc[empty, bin_cols[0]] = total_pkts[empty]
+                for c in bin_cols[1:]:
+                    df.loc[empty, c] = 0
+
     if "SHORTEST_FLOW_PKT" in df.columns and "LONGEST_FLOW_PKT" in df.columns:
-        lo = np.minimum(df["SHORTEST_FLOW_PKT"], df["LONGEST_FLOW_PKT"])
-        hi = np.maximum(df["SHORTEST_FLOW_PKT"], df["LONGEST_FLOW_PKT"]).clip(upper=1514)
-        df["SHORTEST_FLOW_PKT"], df["LONGEST_FLOW_PKT"] = lo, hi
+        # Clip to the MTU ceiling BEFORE taking min/max: clipping only `hi`
+        # (the old order) leaves SHORTEST > 1514 whenever both inputs already
+        # exceed it, violating SHORTEST <= LONGEST <= 1514 simultaneously.
+        s = df["SHORTEST_FLOW_PKT"].clip(upper=MAX_PKT_BYTES)
+        l = df["LONGEST_FLOW_PKT"].clip(upper=MAX_PKT_BYTES)
+        df["SHORTEST_FLOW_PKT"] = np.minimum(s, l)
+        df["LONGEST_FLOW_PKT"] = np.maximum(s, l)
 
     if "MIN_IP_PKT_LEN" in df.columns and "MAX_IP_PKT_LEN" in df.columns:
         lo = np.minimum(df["MIN_IP_PKT_LEN"], df["MAX_IP_PKT_LEN"])
@@ -83,3 +109,15 @@ def assert_feasible(df: pd.DataFrame) -> None:
         if all(c in df.columns for c in (min_c, avg_c, max_c)):
             assert (df[min_c] <= df[avg_c] + 1e-6).all(), f"{min_c} > {avg_c}"
             assert (df[avg_c] <= df[max_c] + 1e-6).all(), f"{avg_c} > {max_c}"
+    if "SHORTEST_FLOW_PKT" in df.columns and "LONGEST_FLOW_PKT" in df.columns:
+        assert (df["SHORTEST_FLOW_PKT"] <= df["LONGEST_FLOW_PKT"] + 1e-6).all(), "SHORTEST_FLOW_PKT > LONGEST_FLOW_PKT"
+        assert (df["LONGEST_FLOW_PKT"] <= MAX_PKT_BYTES + 1e-6).all(), "LONGEST_FLOW_PKT exceeds MTU"
+    if "IN_PKTS" in df.columns and "OUT_PKTS" in df.columns:
+        bin_cols = [c for c in NUM_PKTS_BIN_COLS if c in df.columns]
+        if bin_cols:
+            total_pkts = df["IN_PKTS"] + df["OUT_PKTS"]
+            bin_sum = df[bin_cols].sum(axis=1)
+            # Rounding each bin independently can drift by ~1 packet per bin.
+            assert (bin_sum - total_pkts).abs().le(len(bin_cols) + 1e-6).all(), (
+                "NUM_PKTS_* bins do not sum to IN_PKTS + OUT_PKTS"
+            )

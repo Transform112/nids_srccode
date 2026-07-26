@@ -1,9 +1,17 @@
 """Sanity gates G0-G7. See docs/06_TRAINING.md §8.
 
 Each gate function returns (passed: bool, message: str).
+
+`record_gate` appends results to a per-run `gates_report.json`;
+`prototype_gate_stats` computes the geometry inputs for G2/G2b from a
+prototype bank.
 """
 
 from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 import torch
 
@@ -52,3 +60,61 @@ def gate_g7_overfitting(train_f1: float, val_f1: float, max_gap: float = 0.10) -
     gap = train_f1 - val_f1
     passed = gap <= max_gap
     return passed, f"G7 overfitting: train-val gap={gap:.4f} (max {max_gap})"
+
+
+def record_gate(report_path: str | Path | None, name: str, passed: bool, message: str) -> None:
+    """Print a gate result and append it to `gates_report.json` (if a path is given)."""
+    status = "PASS" if passed else "FAIL"
+    print(f"[gate] {status}  {message}", flush=True)
+    if report_path is None:
+        return
+    report_path = Path(report_path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    entries = []
+    if report_path.is_file():
+        try:
+            entries = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            entries = []
+    entries.append({
+        "gate": name,
+        "passed": passed,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    report_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+
+def prototype_gate_stats(prototype_bank) -> tuple[float, float]:
+    """Compute (mean inter-class centroid cosine, mean intra-class sub-prototype cosine).
+
+    Inputs for G2/G2b. Intra-class mean is 0.0 when no class has more than one
+    sub-prototype (nothing to collapse).
+    """
+    import torch.nn.functional as F
+
+    bank = F.normalize(prototype_bank.bank.detach(), dim=-1)
+    class_of = torch.tensor(prototype_bank.class_of)
+    classes = sorted(set(prototype_bank.class_of))
+
+    centroids = torch.stack([
+        F.normalize(bank[class_of == c].mean(dim=0), dim=-1) for c in classes
+    ])
+    sim = centroids @ centroids.T
+    n = len(classes)
+    if n > 1:
+        triu = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+        inter = float(sim[triu].mean())
+    else:
+        inter = 0.0
+
+    intra_vals = []
+    for c in classes:
+        sub = bank[class_of == c]
+        if sub.shape[0] > 1:
+            s = sub @ sub.T
+            m = sub.shape[0]
+            triu = torch.triu(torch.ones(m, m, dtype=torch.bool), diagonal=1)
+            intra_vals.append(float(s[triu].mean()))
+    intra = float(sum(intra_vals) / len(intra_vals)) if intra_vals else 0.0
+    return inter, intra

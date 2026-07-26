@@ -3,6 +3,7 @@
 data:
   dataset: unsw_nb15
   node_granularity: ip_port
+  subsample_target: null  # "full" per docs/02_DATASETS.md §5.3 — no subsampling
 graph:
   node_granularity: ip_port
 

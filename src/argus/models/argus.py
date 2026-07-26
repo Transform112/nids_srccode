@@ -100,6 +100,7 @@ class ArgusModel(nn.Module):
         target_edge_index: torch.Tensor,
         target_edge_attr: torch.Tensor,
         memory: dict[int, torch.Tensor] | None = None,
+        node_ids: torch.Tensor | None = None,
         batch: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for one batch.
@@ -112,16 +113,32 @@ class ArgusModel(nn.Module):
             target_edge_index: [2, T] (src, dst) node indices of the flows to classify,
                 in the same unified node index space as edge_index_*
             target_edge_attr: [T, F_e] the target flows' own feature vectors
-            memory: optional per-node memory dict
+            memory: optional per-node memory dict, keyed by GLOBAL node id
+                (`batch["node_ids"]` from `AnchorBinGraphSource.build_bin_batch`,
+                NOT the local 0..N-1 index — a bin's local index space is
+                remapped independently per bin, so it cannot key memory across
+                bins). Mutated in place with this bin's updated states.
+            node_ids: [N] the GLOBAL node id for each row of `node_feat`, same
+                order/length. Required (with `memory`) to actually read/write
+                per-node state; without it TE6 has no effect (`m_v ≡ 0`),
+                matching the `te6_enabled=false` ablation.
             batch: [N] graph ids
         Returns:
             outputs dict from head plus intermediate tensors.
         """
         mem_tensor = None
-        if memory is not None and self.memory is not None:
-            node_ids = torch.arange(node_feat.shape[0], device=node_feat.device)
-            # memory not used here; integrate externally for streaming
-            mem_tensor = None
+        if memory is not None and self.memory is not None and node_ids is not None:
+            ids_cpu = node_ids.detach().cpu().tolist()
+            # NOT detached: gradient flows through this read back into the
+            # GRU (and the earlier bins that fed it) within a BPTT chunk.
+            # run_epoch steps the optimizer once per chunk and detaches the
+            # whole memory dict at the boundary, which is what makes an
+            # un-detached read safe (no parameter is mutated in place while
+            # a graph referencing it is still pending backward).
+            mem_tensor = torch.stack([
+                memory.get(i, torch.zeros(self.cfg.model.d_h, device=node_feat.device))
+                for i in ids_cpu
+            ])
 
         # Short scale
         x_s, _, _ = self.encoder.forward_scale(
@@ -142,9 +159,11 @@ class ArgusModel(nn.Module):
             memory=mem_tensor, batch=batch, scale_id=2,
         )
 
-        # Update memory on long scale if enabled
-        if self.memory is not None and memory is not None and long_agg is not None:
-            node_ids = torch.arange(node_feat.shape[0], device=node_feat.device)
+        # Update memory on long scale if enabled — mutates `memory` in place
+        # (NodeMemory.forward writes state[i] = h for each global node id),
+        # so the caller's persisted dict is updated whether or not it's also
+        # reassigned here.
+        if self.memory is not None and memory is not None and node_ids is not None and long_agg is not None:
             _, memory = self.memory(node_ids, long_agg, memory)
 
         # Compute the target edges' representation at each scale from that

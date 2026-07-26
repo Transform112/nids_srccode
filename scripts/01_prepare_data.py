@@ -64,11 +64,15 @@ def run(
 
     target = subsample_target or cfg.data.subsample_target
     if nrows is not None:
-        target = min(target, nrows)
+        target = min(target, nrows) if target is not None else nrows
 
     # ── Phase 1: chunked clean + cross-chunk dedup → temp parquet ──────────
     seen_hashes: set[int] = set()
     class_counts: dict[str, int] = defaultdict(int)
+    # Per-class time range, needed for Phase 2's time-stratified sampling —
+    # cheap running min/max, no extra pass over the data.
+    class_time_min: dict[str, float] = {}
+    class_time_max: dict[str, float] = {}
     total_read = 0
     total_deduped = 0
     total_kept = 0
@@ -98,9 +102,13 @@ def run(
         if len(chunk) == 0:
             continue
 
-        # Accumulate class counts for subsample planning
+        # Accumulate class counts + time range for subsample planning
         for lbl in chunk["canonical_label"]:
             class_counts[lbl] += 1
+        for lbl, group in chunk.groupby("canonical_label")["FLOW_START_MILLISECONDS"]:
+            lo, hi = float(group.min()), float(group.max())
+            class_time_min[lbl] = min(class_time_min.get(lbl, lo), lo)
+            class_time_max[lbl] = max(class_time_max.get(lbl, hi), hi)
 
         # Append to temp parquet via pyarrow ParquetWriter (streaming, low memory)
         table = pa.Table.from_pandas(chunk.reset_index(drop=True))
@@ -119,71 +127,124 @@ def run(
     if writer is not None:
         writer.close()
 
-    print(f"[01] Phase 1 done: {total_read:,} read → {total_kept:,} kept "
+    print(f"[01] Phase 1 done: {total_read:,} read -> {total_kept:,} kept "
           f"({total_deduped:,} cross-chunk duplicates removed)")
     print(f"[01] Classes found: {len(class_counts)}")
 
     # ── Phase 2: streaming subsample via per-class quotas ──────────────────
-    print(f"[01] Phase 2: streaming subsample (target: {target:,}) ...")
+    if target is None:
+        # data.subsample_target: null means "use in full" (e.g. unsw_nb15,
+        # docs/02_DATASETS.md §5.3's per-dataset override table).
+        print("[01] Phase 2: subsample_target is null — keeping every row")
+        quotas: dict[str, int] = dict(class_counts)
+    else:
+        print(f"[01] Phase 2: streaming subsample (target: {target:,}) ...")
 
-    # Compute per-class quotas from accumulated Phase 1 counts
-    minority_threshold = cfg.data.minority_threshold
-    benign_floor_fraction = cfg.data.benign_floor_fraction
+        # Compute per-class quotas from accumulated Phase 1 counts
+        minority_threshold = cfg.data.minority_threshold
+        benign_floor_fraction = cfg.data.benign_floor_fraction
 
-    # Minority classes: keep all
-    minority_classes = {c for c, n in class_counts.items() if n <= minority_threshold}
-    minority_quota = sum(class_counts[c] for c in minority_classes)
+        # Minority classes: keep all
+        minority_classes = {c for c, n in class_counts.items() if n <= minority_threshold}
+        minority_quota = sum(class_counts[c] for c in minority_classes)
 
-    remaining = max(target - minority_quota, 0)
-    benign_floor = int(benign_floor_fraction * target)
-    non_benign_majority = [c for c in class_counts if c not in minority_classes and c != "benign"]
+        remaining = max(target - minority_quota, 0)
+        benign_floor = int(benign_floor_fraction * target)
+        non_benign_majority = [c for c in class_counts if c not in minority_classes and c != "benign"]
 
-    # Benign quota (floored)
-    benign_count = class_counts.get("benign", 0)
-    benign_quota = min(benign_count, max(benign_floor, remaining // 2))
-    remaining -= benign_quota
+        quotas = {}
+        for c in minority_classes:
+            quotas[c] = class_counts[c]  # keep all
 
-    # Distribute remaining among non-benign majority classes proportionally
-    total_non_benign = sum(class_counts[c] for c in non_benign_majority)
-    quotas: dict[str, int] = {}
-    for c in minority_classes:
-        quotas[c] = class_counts[c]  # keep all
-    quotas["benign"] = benign_quota
-    for c in non_benign_majority:
-        if total_non_benign > 0 and remaining > 0:
-            share = int(remaining * class_counts[c] / total_non_benign)
-            quotas[c] = min(class_counts[c], share)
-        else:
-            quotas[c] = 0
+        # Benign quota (floored) — skip if benign already got "keep all" above;
+        # otherwise this would silently clobber that with a smaller floor-based
+        # number (reachable on a small --nrows smoke-test slice).
+        if "benign" not in minority_classes:
+            benign_count = class_counts.get("benign", 0)
+            benign_quota = min(benign_count, max(benign_floor, remaining // 2))
+            remaining = max(remaining - benign_quota, 0)
+            quotas["benign"] = benign_quota
+
+        # Distribute remaining among non-benign majority classes proportionally
+        total_non_benign = sum(class_counts[c] for c in non_benign_majority)
+        for c in non_benign_majority:
+            if total_non_benign > 0 and remaining > 0:
+                share = int(remaining * class_counts[c] / total_non_benign)
+                quotas[c] = min(class_counts[c], share)
+            else:
+                quotas[c] = 0
 
     print(f"[01] Quotas: {len(quotas)} classes")
     for c, q in sorted(quotas.items()):
-        print(f"[01]   {c}: {class_counts[c]:,} → {q:,}")
+        print(f"[01]   {c}: {class_counts[c]:,} -> {q:,}")
 
-    # Streaming subsample: read temp parquet in chunks, keep rows by class ratio
+    # Per-class time-bin quotas for classes not kept in full — spreads kept
+    # rows across each class's *entire* observed time range instead of
+    # greedily taking the first N rows encountered (which silently
+    # concentrates a subsampled majority class into whichever chunks arrive
+    # first — e.g. CICIDS2018 benign, present across 9 capture days in the
+    # raw data, previously collapsed to ~2 days by the old first-N logic).
+    # An approximation of docs/02_DATASETS.md §5.3's "T=100 equal-count time
+    # bins": these are equal-*width* bins (tractable in one streaming pass;
+    # exact equal-count bins would need a second full scan for bin edges).
+    n_bins_cfg = max(cfg.data.time_bins_for_subsample, 1)
+    class_bin_params: dict[str, tuple[float, float, int, int]] = {}
+    for c, quota in quotas.items():
+        if quota <= 0 or quota >= class_counts[c]:
+            continue  # kept in full (or dropped entirely) — no binning needed
+        t_min, t_max = class_time_min[c], class_time_max[c]
+        n_bins = min(n_bins_cfg, class_counts[c])
+        bin_width = max((t_max - t_min) / n_bins, 1.0)
+        per_bin_quota = -(-quota // n_bins)  # ceil division — may overshoot
+        class_bin_params[c] = (t_min, bin_width, n_bins, per_bin_quota)  # quota by up to n_bins rows
+
+    # Streaming subsample: read temp parquet in chunks, keep rows by
+    # per-class (full-keep) or per-class-per-time-bin (subsampled) quota.
     kept_frames: list[pd.DataFrame] = []
     counters: dict[str, int] = defaultdict(int)
+    bin_counters: dict[str, np.ndarray] = {
+        c: np.zeros(n_bins, dtype=np.int64) for c, (_, _, n_bins, _) in class_bin_params.items()
+    }
 
     for batch in pq.ParquetFile(temp_path).iter_batches(batch_size=chunksize):
         chunk = batch.to_pandas()
         mask = pd.Series(False, index=chunk.index)
+        label_arr = chunk["canonical_label"].to_numpy()
+        time_arr = chunk["FLOW_START_MILLISECONDS"].to_numpy()
+
         for cls_name, quota in quotas.items():
             if quota == 0:
                 continue
-            cls_mask = chunk["canonical_label"] == cls_name
-            cls_rows = chunk[cls_mask]
-            n_available = len(cls_rows)
+            cls_idx = np.nonzero(label_arr == cls_name)[0]
+            if len(cls_idx) == 0:
+                continue
             n_needed = quota - counters[cls_name]
             if n_needed <= 0:
                 continue
-            if n_needed >= n_available:
-                mask[cls_mask] = True
-                counters[cls_name] += n_available
-            else:
-                # Take first n_needed (rows are time-ordered within class)
-                cls_indices = cls_rows.index[:n_needed]
-                mask[cls_indices] = True
-                counters[cls_name] += n_needed
+
+            if cls_name not in class_bin_params:
+                # Kept in full: take every remaining row of this class.
+                take = cls_idx[:n_needed]
+                mask.iloc[take] = True
+                counters[cls_name] += len(take)
+                continue
+
+            t_min, bin_width, n_bins, per_bin_quota = class_bin_params[cls_name]
+            bin_ids = np.clip(((time_arr[cls_idx] - t_min) / bin_width).astype(np.int64), 0, n_bins - 1)
+            counts = bin_counters[cls_name]
+            # Vectorized rank-within-bin (0-based occurrence order, original
+            # row order preserved) — avoids a per-row Python loop over
+            # millions of candidate rows for large majority classes.
+            rank_in_bin = pd.Series(bin_ids).groupby(bin_ids).cumcount().to_numpy()
+            room = np.maximum(per_bin_quota - counts[bin_ids], 0)
+            keep_row = rank_in_bin < room
+            if not keep_row.any():
+                continue
+            take = cls_idx[keep_row]
+            mask.iloc[take] = True
+            np.add.at(counts, bin_ids[keep_row], 1)
+            counters[cls_name] += int(keep_row.sum())
+
         if mask.any():
             kept_frames.append(chunk[mask])
 

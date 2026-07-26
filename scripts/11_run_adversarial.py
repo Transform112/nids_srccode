@@ -40,8 +40,11 @@ from argus.config import load_config, resolved_path  # noqa: E402
 from argus.features.pipeline import FeaturePipeline  # noqa: E402
 from argus.graph.batching import AnchorBinGraphSource  # noqa: E402
 from argus.graph.builder import assign_node_ids  # noqa: E402
+from argus.graph.node_features import node_feature_dim  # noqa: E402
 from argus.models.argus import ArgusModel  # noqa: E402
 from argus.train.checkpoint import load_checkpoint  # noqa: E402
+
+BENIGN_LABEL = "benign"  # canonical form — cfg.classes.benign ("Benign") is the raw label
 
 
 def _build_source(df: pd.DataFrame, cfg, feature_names: list[str]) -> AnchorBinGraphSource:
@@ -62,6 +65,9 @@ def _build_source(df: pd.DataFrame, cfg, feature_names: list[str]) -> AnchorBinG
         neighbour_cap=cfg.graph.neighbour_cap,
         sampling=cfg.graph.sampling,
         strata=cfg.graph.strata,
+        te7_enabled=cfg.features.te7_enabled,
+        spectral_nbins=cfg.features.spectral_nbins,
+        spectral_min_flows=cfg.features.spectral_min_flows,
     )
 
 
@@ -101,9 +107,18 @@ def run(
     with open(vocab_path) as f:
         class_names = json.load(f)
     label_to_id = {c: i for i, c in enumerate(class_names)}
-    benign_class_id = label_to_id[cfg.classes.benign]
+    benign_class_id = label_to_id[BENIGN_LABEL]
 
     pipeline = FeaturePipeline.load(artifact_dir / "feature_pipeline.joblib")
+
+    # class_counts must match what the checkpoint was trained with (computed
+    # from the train split by scripts 04/05) — PrototypeBank's sub-prototype
+    # count per class depends on it, and a mismatch makes load_checkpoint's
+    # strict state-dict load raise a size-mismatch error. Also doubles as the
+    # source for A2's benign injection pool (sampled from train, not test —
+    # docs/10_ADVERSARIAL.md §3 step 2).
+    train_feat_full = pd.read_parquet(processed_dir / "train_features.parquet")
+    class_counts = train_feat_full["canonical_label"].value_counts().to_dict()
 
     raw_test = pd.read_parquet(processed_dir / "test.parquet")
     raw_test = raw_test.sort_values("FLOW_START_MILLISECONDS", kind="stable").reset_index(drop=True)
@@ -113,7 +128,10 @@ def run(
     feat_test["_label_id"] = feat_test["canonical_label"].map(label_to_id)
 
     device = torch.device(cfg.run.device if torch.cuda.is_available() or cfg.run.device == "cpu" else "cpu")
-    model = ArgusModel(cfg, f_e=f_e, f_v=18, class_names=class_names).to(device)
+    f_v = node_feature_dim(cfg.features.te7_enabled)
+    model = ArgusModel(
+        cfg, f_e=f_e, f_v=f_v, class_names=class_names, class_counts=class_counts
+    ).to(device)
 
     ckpt_dir = Path(__file__).parents[1] / cfg.run.out_dir
     stage2_ckpt = ckpt_dir / f"{dataset}_stage2" / "stage2_final.pt"
@@ -128,16 +146,16 @@ def run(
         raise FileNotFoundError("No trained checkpoint found; run scripts/04 and 05 first.")
 
     source = _build_source(feat_test, cfg, feature_names)
-    benign_pool = feat_test.loc[
-        feat_test["canonical_label"] == cfg.classes.benign, feature_names
+    benign_pool = train_feat_full.loc[
+        train_feat_full["canonical_label"] == BENIGN_LABEL, feature_names
     ].to_numpy(dtype=np.float32)
     if len(benign_pool) == 0:
-        raise ValueError("No benign flows found in the test split for A2's injection pool.")
+        raise ValueError("No benign flows found in the train split for A2's injection pool.")
 
     rng = np.random.default_rng(seed)
     results: dict[str, list] = {"a1": [], "a2": [], "a4": [], "a5": [], "a3": []}
 
-    attack_classes = [c for c in class_names if c != cfg.classes.benign]
+    attack_classes = [c for c in class_names if c != BENIGN_LABEL]
 
     for attack_class in attack_classes:
         idxs = np.nonzero(feat_test["canonical_label"].to_numpy() == attack_class)[0]
@@ -203,7 +221,10 @@ def run(
                 for poison_rate in cfg.attack.a3_poison_rates:
                     a3_result = run_a3_poison_sweep(
                         model.head, class_idx, poison_rate=poison_rate, momentum=0.99,
-                        n_steps=200, theta_unknown=cfg.head.theta_unknown or 0.5,
+                        n_steps=200,
+                        theta_unknown=(
+                            cfg.head.theta_unknown if cfg.head.theta_unknown is not None else 0.5
+                        ),
                         gate_enabled=gate_enabled, seed=seed,
                     )
                     results["a3"].append({"attack_class": attack_class, **asdict(a3_result)})

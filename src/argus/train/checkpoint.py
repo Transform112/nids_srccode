@@ -5,6 +5,7 @@ See docs/06_TRAINING.md §6.
 
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,11 @@ def save_checkpoint(
     epoch: int,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    """Save model/optimizer/RNG state for resumable training."""
+    """Save model/optimizer/RNG state for resumable training.
+
+    Written atomically (temp file + rename) so a session killed mid-save
+    never corrupts the only resumable checkpoint.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     state = {
@@ -33,7 +38,9 @@ def save_checkpoint(
         "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "extra": extra or {},
     }
-    torch.save(state, path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
 
 
 def load_checkpoint(

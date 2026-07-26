@@ -37,6 +37,7 @@ class AnchorBinGraphSource:
         te7_enabled: bool = True,
         spectral_nbins: int = 64,
         spectral_min_flows: int = 8,
+        is_injected: np.ndarray | None = None,
     ) -> None:
         order = np.argsort(times_ms, kind="stable")
         self.times_ms = times_ms[order]
@@ -44,6 +45,15 @@ class AnchorBinGraphSource:
         self.src_ids = src_ids[order]
         self.dst_ids = dst_ids[order]
         self.labels = labels[order]
+        # Adversarial provenance mask (A2 structural injection): True for
+        # synthetic attacker-injected flows. Must be reordered with the same
+        # sort — injected timestamps interleave with real ones, so injected
+        # rows are NOT contiguous after construction (figure F7 depends on
+        # per-edge identification surviving the sort).
+        if is_injected is None:
+            self.is_injected = np.zeros(len(self.times_ms), dtype=bool)
+        else:
+            self.is_injected = np.asarray(is_injected, dtype=bool)[order]
 
         self.bin_ids = assign_anchor_bins(self.times_ms, anchor_bin_seconds)
         self.anchor_bin_seconds = anchor_bin_seconds
@@ -66,23 +76,40 @@ class AnchorBinGraphSource:
         self.spectral_min_flows = spectral_min_flows
         self._prev_active_nodes: set[int] = set()
 
-    def _cap_and_extract(self, lo: int, hi: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def reset_epoch_state(self) -> None:
+        """Reset cross-bin state at the start of an epoch pass.
+
+        `_prev_active_nodes` feeds the "newly active node" feature and must
+        start empty at split start (docs/04_GRAPH_CONSTRUCTION.md §3). Without
+        this reset, epoch k>0's first bins would see the *last* bins of the
+        previous epoch replay as "the previous bin" — an artifact of the epoch
+        loop, not real temporality — and uncached training would silently
+        diverge from cached training (the cache is built in one fresh pass).
+        """
+        self._prev_active_nodes = set()
+
+    def _cap_and_extract(
+        self, lo: int, hi: int, window_seconds: float
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Cap neighbours for edges[lo:hi]; return raw (uncapped-index) arrays."""
         if hi <= lo:
             empty_f = np.zeros((0, self.edge_features.shape[1]), dtype=np.float32)
-            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), empty_f, np.zeros(0, dtype=np.float32)
+            return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), empty_f,
+                    np.zeros(0, dtype=np.float32), np.zeros(0, dtype=bool))
         src = self.src_ids[lo:hi]
         dst = self.dst_ids[lo:hi]
         feat = self.edge_features[lo:hi]
+        inj = self.is_injected[lo:hi]
         window_end = self.times_ms[hi - 1]
         dt_seconds = (window_end - self.times_ms[lo:hi]) / 1000.0
 
         keep = sample_neighbours(
-            dst, k=self.neighbour_cap, strategy=self.sampling, strata=self.strata, rng=self.rng
+            dst, k=self.neighbour_cap, strategy=self.sampling, strata=self.strata, rng=self.rng,
+            age_seconds=dt_seconds, window_seconds=window_seconds,
         )
         if len(keep) == 0:
             keep = np.arange(len(dst))
-        return src[keep], dst[keep], feat[keep], dt_seconds[keep].clip(min=0.0)
+        return src[keep], dst[keep], feat[keep], dt_seconds[keep].clip(min=0.0), inj[keep]
 
     def _raw_long_window(self, lo: int, hi: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return uncapped (src, dst, times, byte-magnitude proxy) for node feature computation.
@@ -120,7 +147,7 @@ class AnchorBinGraphSource:
             if bin_id not in ranges[name]:
                 return None
             lo, hi = ranges[name][bin_id]
-            raw[name] = self._cap_and_extract(lo, hi)
+            raw[name] = self._cap_and_extract(lo, hi, self.scale_durations[name])
 
         long_lo, long_hi = ranges["long"][bin_id]
         self._last_long_raw = self._raw_long_window(long_lo, long_hi)
@@ -137,12 +164,14 @@ class AnchorBinGraphSource:
             return torch.tensor(np.stack([ls, ld]), dtype=torch.long)
 
         scale_tensors = {}
+        edge_injected = {}
         for name in ("short", "mid", "long"):
-            src, dst, feat, dt = raw[name]
+            src, dst, feat, dt, inj = raw[name]
             edge_index = _remap(src, dst)
             edge_attr = torch.tensor(feat, dtype=torch.float32)
             edge_dt = torch.tensor(dt, dtype=torch.float32)
             scale_tensors[name] = (edge_index, edge_attr, edge_dt)
+            edge_injected[name] = torch.tensor(inj, dtype=torch.bool)
 
         # Target flows: those whose bin_id == bin_id. They are guaranteed inside
         # the short-scale window by construction (docs/04_GRAPH_CONSTRUCTION.md §5).
@@ -165,9 +194,16 @@ class AnchorBinGraphSource:
 
         n_nodes = max(len(local), 1)
         node_feat = self._compute_node_features(local, n_nodes, f_v)
+        # Global node id per local index — required to key the per-node TE6
+        # memory dict correctly across bins (local indices are meaningless
+        # across bins; each bin remaps node ids independently).
+        node_ids = torch.tensor(
+            sorted(local, key=lambda k: local[k]), dtype=torch.long
+        )
 
         return {
             "node_feat": node_feat,
+            "node_ids": node_ids,
             "scale_short": scale_tensors["short"],
             "scale_mid": scale_tensors["mid"],
             "scale_long": scale_tensors["long"],
@@ -175,6 +211,9 @@ class AnchorBinGraphSource:
             "target_edge_attr": target_edge_attr,
             "target_labels": torch.tensor(target_labels, dtype=torch.long),
             "n_targets": len(target_global_positions),
+            # Per-scale bool mask over context edges: True = A2-injected flow
+            # (figure F7's injected_mass_fraction; all-False on clean sources).
+            "edge_injected": edge_injected,
         }
 
     def _compute_node_features(

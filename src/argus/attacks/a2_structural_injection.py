@@ -86,6 +86,7 @@ def build_injected_source(
     spread: str = "all_strata",
     strata: int = 4,
     seed: int = 0,
+    benign_class_id: int = 0,
 ) -> AnchorBinGraphSource:
     """Return a new source with `budget` synthetic flows injected into the
     victim's long window, ending strictly before the target bin.
@@ -121,17 +122,26 @@ def build_injected_source(
     inj_feats = sample_benign_like_flows(benign_pool, budget, rng)
     inj_src = np.full(budget, injection_host_id, dtype=np.int64)
     inj_dst = np.full(budget, victim_node_id, dtype=np.int64)
-    inj_labels = np.zeros(budget, dtype=source.labels.dtype)  # benign-labelled context only
+    inj_labels = np.full(budget, benign_class_id, dtype=source.labels.dtype)  # benign context only
 
     new_times = np.concatenate([source.times_ms, inj_times.astype(source.times_ms.dtype)])
     new_feats = np.concatenate([source.edge_features, inj_feats.astype(source.edge_features.dtype)])
     new_src = np.concatenate([source.src_ids, inj_src])
     new_dst = np.concatenate([source.dst_ids, inj_dst])
     new_labels = np.concatenate([source.labels, inj_labels])
+    # Provenance mask for F7: carries any pre-existing injected flags through
+    # (stacked attacks) and marks the new rows. The constructor re-sorts by
+    # time, so this must be passed in rather than inferred positionally.
+    new_injected = np.concatenate([source.is_injected, np.ones(budget, dtype=bool)])
 
     return AnchorBinGraphSource(
         new_times, new_feats, new_src, new_dst, new_labels,
-        anchor_bin_seconds=1,  # bin boundaries recomputed from t0; see note below
+        # Must match the source this was built from: evaluate_flow() looks up
+        # the *same* bin_id in both clean_source and this injected source, and
+        # bin_id is only comparable across the two if anchor_bin_seconds
+        # agrees (bin_id = floor(t/anchor_bin_seconds) — a mismatch silently
+        # points evaluate_flow at an unrelated time window post-injection).
+        anchor_bin_seconds=source.anchor_bin_seconds,
         window_short_seconds=source.scale_durations["short"],
         window_mid_seconds=source.scale_durations["mid"],
         window_long_seconds=source.scale_durations["long"],
@@ -142,6 +152,7 @@ def build_injected_source(
         te7_enabled=source.te7_enabled,
         spectral_nbins=source.spectral_nbins,
         spectral_min_flows=source.spectral_min_flows,
+        is_injected=new_injected,
     )
 
 
@@ -211,6 +222,7 @@ def run_a2_budget_sweep(
             injected_source = build_injected_source(
                 clean_source, bin_id, victim_node_id, injection_host_id,
                 benign_pool, budget=m, spread=spread, strata=strata,
+                benign_class_id=benign_class_id,
             )
             attacked_decision, attacked_evidence = evaluate_flow(
                 model, injected_source, bin_id, target_index_within_bin, device

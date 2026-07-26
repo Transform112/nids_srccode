@@ -30,6 +30,7 @@ from argus.models.baselines.egatv2 import EGATv2  # noqa: E402
 from argus.models.baselines.egraphsage import EGraphSAGE  # noqa: E402
 from argus.models.baselines.identity_only import IdentityOnlyClassifier  # noqa: E402
 from argus.models.baselines.tabular import TabularBaseline  # noqa: E402
+from argus.utils.io import derive_class_vocab  # noqa: E402
 
 
 def _run_tabular(name: str, baseline, x_train, y_train, x_test, y_test, class_names) -> dict:
@@ -47,8 +48,7 @@ def _run_identity_only(train_df, test_df, y_train, y_test, class_names) -> dict:
     return closed_set_report(y_test, pred, class_names)
 
 
-def _gnn_baseline_source(processed_dir, split, cfg, feature_names) -> AnchorBinGraphSource:
-    df = pd.read_parquet(processed_dir / f"{split}_features.parquet")
+def _gnn_baseline_source(df: pd.DataFrame, cfg, feature_names: list[str]) -> AnchorBinGraphSource:
     df = df.sort_values("FLOW_START_MILLISECONDS").reset_index(drop=True)
     src_ids, dst_ids, _ = assign_node_ids(
         df, node_granularity=cfg.graph.node_granularity,
@@ -70,11 +70,11 @@ def _gnn_baseline_source(processed_dir, split, cfg, feature_names) -> AnchorBinG
 
 
 def _run_gnn_baseline(
-    name, model, processed_dir, cfg, feature_names, class_names, device, max_bins=None
+    name, model, train_df, test_df, cfg, feature_names, class_names, device, max_bins=None
 ) -> dict:
     print(f"[14] Training {name} (mid scale, uncapped neighbourhoods) ...")
-    train_source = _gnn_baseline_source(processed_dir, "train", cfg, feature_names)
-    test_source = _gnn_baseline_source(processed_dir, "test", cfg, feature_names)
+    train_source = _gnn_baseline_source(train_df, cfg, feature_names)
+    test_source = _gnn_baseline_source(test_df, cfg, feature_names)
 
     model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -142,23 +142,18 @@ def run(
     train_df = pd.read_parquet(processed_dir / "train_features.parquet")
     test_df = pd.read_parquet(processed_dir / "test_features.parquet")
 
-    from argus.utils.io import resolve_class_vocab
-    try:
-        class_vocab_path = resolve_class_vocab(cfg, dataset, artifact_dir)
-    except FileNotFoundError:
-        class_vocab_path = artifact_dir / "class_vocab.json"
-    if class_vocab_path.exists():
-        with open(class_vocab_path) as f:
-            class_names = json.load(f)
-    else:
-        class_names = sorted(train_df["canonical_label"].unique().tolist())
-        with open(class_vocab_path, "w") as f:
-            json.dump(class_names, f, indent=2)
+    # Baselines train their own models from scratch (no ARGUS checkpoint to
+    # match vocab against), so derive directly from data rather than
+    # reading/writing a class_vocab.json — artifact_dir may be a read-only
+    # Kaggle input mount, and this script may legitimately run before any
+    # ARGUS training (AGENT_GUIDE.md: "P2 is deliberately early").
+    class_names = derive_class_vocab(train_df)
     label_to_id = {c: i for i, c in enumerate(class_names)}
 
+    # _label_id stays in-memory only — processed_dir may be a read-only
+    # Kaggle input mount, so never write derived columns back to it.
     train_df["_label_id"] = train_df["canonical_label"].map(label_to_id)
     test_df["_label_id"] = test_df["canonical_label"].map(label_to_id)
-    test_df.to_parquet(processed_dir / "test_features.parquet", index=False)
 
     y_train = train_df["_label_id"].to_numpy()
     y_test = test_df["_label_id"].to_numpy()
@@ -182,18 +177,17 @@ def run(
 
     if not skip_egraphsage or not skip_egatv2:
         device = torch.device(cfg.run.device if torch.cuda.is_available() or cfg.run.device == "cpu" else "cpu")
-        train_df.to_parquet(processed_dir / "train_features.parquet", index=False)
 
     if not skip_egraphsage:
         model = EGraphSAGE(f_e=f_e, d_h=64, num_classes=len(class_names), layers=2)
         results["egraphsage"] = _run_gnn_baseline(
-            "E-GraphSAGE", model, processed_dir, cfg, feature_names, class_names, device, max_bins=max_bins
+            "E-GraphSAGE", model, train_df, test_df, cfg, feature_names, class_names, device, max_bins=max_bins
         )
 
     if not skip_egatv2:
         model = EGATv2(f_e=f_e, d_h=64, num_classes=len(class_names), layers=2, heads=4)
         results["egatv2"] = _run_gnn_baseline(
-            "EGATv2", model, processed_dir, cfg, feature_names, class_names, device, max_bins=max_bins
+            "EGATv2", model, train_df, test_df, cfg, feature_names, class_names, device, max_bins=max_bins
         )
 
     out_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_baselines"

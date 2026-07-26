@@ -48,6 +48,16 @@ curves are exempt (a curve is not a selection).
 | `spectral.nbins` | 64 | {32, 64, 128} | E-ABL-T7 | TE7 FFT resolution |
 | `spectral.min_flows` | 8 | fixed | — | Below this, emit zero vector |
 
+**Deviation — CICIDS2018 compute budget.** `config/dataset/cicids2018.yaml`
+sets `anchor_bin_seconds=10` and `window_short_seconds=10`, outside the
+`{1, 5}` / `{0.5, 1, 2}` ranges above. At `anchor_bin_seconds=1` the train
+split produces 61,692 bins/epoch; uncached graph construction runs
+~4-5 sec/bin (~82h/epoch), which does not fit a single Kaggle GPU session.
+10s keeps the short/mid/long multi-scale design intact, just coarsens the
+short (burst) scale. Revisit if more compute becomes available — see
+`docs/TODO.md` "Open decisions". Other datasets (`ton_iot`, `unsw_nb15`,
+`bot_iot`) are unaffected and still default to 1s.
+
 ## 4. Model
 
 | Parameter | Default | Range | Tuned by | Notes |

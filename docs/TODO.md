@@ -106,8 +106,12 @@ experiment IDs to `13_EXPERIMENT_MATRIX.md`.
 - [x] `models/memory.py` — per-node GRU + memory dropout (eviction handled via BPTT detach)
 - [x] `models/srteg.py` — encoder
 - [x] `models/multiscale.py` — gated fusion
-- [x] `scripts/03_cache_graphs.py` — built; hashes split/scale/K/sampling/granularity
-      for cache-key determinism, saves unique_bins + meta per split. Not yet run at scale.
+- [x] `scripts/03_cache_graphs.py` — single-process, gzip-compressed (`.pt.gz`)
+      per-bin cache precompute; `graph/cache.py::verify_or_write_cache_meta`
+      fingerprints anchor/window/K/sampling/strata/granularity per split cache
+      dir and raises on drift instead of silently replaying mismatched graphs.
+      Run at scale locally on CICIDS2018: 9,375 train + 3,248 val bins, 3.3GB,
+      0 errors (test split intentionally not cached by default).
 - [x] Tests: `test_graph`, `test_aggregation`, `test_time_encoding` (spectral covered
       via `test_node_features_are_real_signal_not_zeros`)
 - [ ] Run E-CS-FULL; confirm parity with E-GraphSAGE — mechanics verified end-to-end
@@ -223,6 +227,91 @@ experiment IDs to `13_EXPERIMENT_MATRIX.md`.
 - [x] **Tests: 97 passing** (was 90; +7 for AnomalE + posthoc OSR)
 - [x] All 15 scripts (00-15) are real implementations that can run on Kaggle
 
+## Session 2026-07-26 — full codebase audit before first Kaggle training run
+
+Diagnosed via manual review + 5 parallel subsystem audits (data/features,
+model architecture/graph, training/losses/config, eval/baselines/streaming,
+adversarial/XAI), each cross-checking code against its doc chapter. Full
+findings, fixes, and open decisions in `docs/BUGS.md` — do not duplicate that
+detail here.
+
+- [x] Fixed ~30 confirmed bugs, several critical (would have crashed the next
+      real Kaggle run or silently corrupted results): cache/label-vocab
+      consistency, cache config-fingerprint guard, `resolve_class_vocab` path
+      bug, read-only-filesystem writes in `14_run_baselines.py`, dead
+      `DistanceThresholdHead` fallback, `te7_enabled`/`f_v` not threaded
+      through graph construction, `tau_hat` fighting its anneal schedule,
+      config schema gap for `classes.*`, canonical-label bugs + missing
+      `class_counts` in `11_run_adversarial.py`/`12_run_xai.py`, A2's
+      hardcoded `anchor_bin_seconds=1`, OpenMax per-class recalibration
+      overwrite, `eval/selective.py` numpy 2.x crash + sign inversion,
+      `07_eval_open_set.py`/`09_eval_transfer.py` threshold-from-test-not-val
+      + fake score matrix, streaming latency measurement gap, EPC log-space
+      round-trip, prototype diversity-loss double-counting, subsample
+      quota edge cases, missing per-dataset `subsample_target` overrides.
+- [x] 97 tests still passing after every fix (re-run throughout, not just once).
+- [ ] **Not fixed, flagged in `docs/BUGS.md` "Decisions needed":** run
+      registry used by ~1 script (no per-epoch checkpoint/resume in 04/05 —
+      real risk given 12h Kaggle sessions); gates G0-G7 never invoked; C4/F7
+      XAI-adversarial linkage unimplemented; open-set/few-shot eval scores
+      checkpoints that already saw "held-out" classes during training.
+
+Per your explicit decision, additionally fixed (same session, second pass):
+- [x] Subsample's actual chronological-bias bug (not just the quota
+      arithmetic) — real per-class time-bin stratification implemented;
+      full local pipeline (01→02→03_fit_features→03_cache_graphs→14) redone
+      from scratch with the fix.
+- [x] `soft_medoid` aggregation no longer discarded under
+      `multi_aggregator=true`; multi-aggregator's 3rd term fixed from a
+      scalar to the documented `a_scale · a_robust` vector product.
+- [x] Time-decayed attention decay now normalised by scale duration (was
+      raw seconds against a lambda calibrated for normalised time —
+      degenerated mid/long-scale attention to near-hard most-recent-edge).
+- [x] `recency_stratified` sampling now buckets by actual elapsed time
+      within the declared (attacker-independent) window, not array
+      position/count.
+- [x] Node features (`byte_volume`, burst counts, gaps) now accumulate on
+      both sides of a flow, not just the source — a pure flood/scan victim
+      no longer reads as all-zero on exactly the features meant to catch it.
+- [x] TE6 per-node memory now genuinely computed and flows into node
+      states every bin (`te6_enabled` is no longer bit-identical true vs
+      false) — **with a caveat**: the GRU's own weights still can't receive
+      gradient under the current per-bin-optimizer-step training loop
+      (structural, not a detach-placement issue; needs `run_epoch()`
+      restructured to accumulate loss over a BPTT chunk before stepping).
+      Full reasoning and the two failed intermediate attempts are recorded
+      in `docs/BUGS.md` for whoever picks this up next.
+- [x] 97 tests still passing after every fix in this second pass too.
+
+Per your explicit instruction ("fix these 4 issues and also try to fix the
+issue of gru weights"), third pass same session — full detail in
+`docs/BUGS.md` #39-#44, Kaggle sequencing in `docs/KAGGLE_PLAN.md`:
+- [x] **TE6 GRU now genuinely learned** — `run_epoch` restructured to true
+      8-bin truncated BPTT (one backward/step per chunk, memory detached at
+      chunk boundaries only); the #38 caveat is resolved, GRU weights verified
+      to receive gradient.
+- [x] **Per-epoch checkpoint/resume + registry** — `stage{1,2}_ckpt_last/best.pt`
+      every epoch (atomic, real optimizer + RNG), `--resume`/`--force` on
+      04/05, registry skip of completed runs, best-weight restore at return;
+      kill-and-resume trajectory test green (also root-caused and fixed a
+      cross-epoch `_prev_active_nodes` leak found while proving it).
+- [x] **Gates wired** — G0 preflight (default-on, hard-fail) in 04;
+      G1/G2/G2b/G5/G6/G7 in stage 1; G3/G4/G6 in stage 2; results in
+      `<run_dir>/gates_report.json`.
+- [x] **C4/F7 implemented** — `is_injected` mask through graph construction,
+      `attr_edge` + `injected_mass_fraction` in `evidence_attrib.py`, F7
+      budget×aggregation sweep in `12_run_xai.py`; 3 new tests.
+- [x] **Open-set/few-shot leakage fixed** — per-holdout training path
+      (`--holdout-index` through 02/03/03_cache/04/05, persisted
+      `holdout_sets.json`, per-holdout pipelines/caches/checkpoints); 07/08
+      rewritten to score each holdout with its own holdout-excluded
+      checkpoint (07 refuses leaked vocabularies); 08 additionally fixed to
+      embed real n-shot flows of the registered class, do a bitwise
+      state-dict zero-change check, and reload fresh checkpoints per
+      configuration; holdout-0 splits+features built and verified on the
+      real data.
+- [x] **103 tests passing** (97 + 6 new).
+
 ## Evaluation runs
 
 Ordered per `13_EXPERIMENT_MATRIX.md` §11. A submittable draft exists after step 7.
@@ -244,6 +333,11 @@ Ordered per `13_EXPERIMENT_MATRIX.md` §11. A submittable draft exists after ste
 
 ## Open decisions
 
+- [ ] CICIDS2018 runs at `anchor_bin_seconds=10`/`window_short_seconds=10`,
+      outside the documented `{1,5}`/`{0.5,1,2}` ranges (`07_HYPERPARAMETERS.md`
+      §3) — a compute-budget deviation to fit training in a single Kaggle GPU
+      session (61,692 bins/epoch at 1s was ~82h/epoch uncached). Revisit with
+      more compute, or accept and note as a limitation in the paper.
 - [x] ~~Confirm NF-v3 CSVs are downloaded and readable~~ — all four present in `dataset/`
 - [ ] Decide whether GraphIDS is reproducible within budget (during P2)
 - [ ] Decide whether to enable EMA prototype drift correction in the final

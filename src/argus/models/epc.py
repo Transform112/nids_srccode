@@ -118,10 +118,17 @@ class EPCHead(nn.Module):
         S = torch.exp(log_S)
         alpha = e + 1.0
         log_alpha = torch.log1p(e)
-        p_hat = alpha / S.unsqueeze(-1)
-        vacuity = c / S
-        # For classification logits use expected probabilities
-        logits = torch.log(p_hat.clamp_min(1e-12))
+        # log p_hat = log(alpha) - log(S), log vacuity = log(C) - log(S)
+        # (docs/05_ARCHITECTURE.md §6.3 rule 2) — derive the real-valued
+        # p_hat/vacuity from these via one final exp(), rather than dividing
+        # in real space and then re-logging the result for log_p_hat/logits.
+        # Mathematically equivalent at log_evidence_clamp=15, but avoids
+        # reintroducing the exp()-mediated gradient path the log-space
+        # mandate exists to avoid if the clamp or tau_min is ever loosened.
+        log_p_hat = log_alpha - log_S.unsqueeze(-1)
+        log_vacuity = log_c - log_S
+        p_hat = torch.exp(log_p_hat)
+        vacuity = torch.exp(log_vacuity)
         return {
             "z": z,
             "log_e": log_e,
@@ -129,10 +136,10 @@ class EPCHead(nn.Module):
             "S": S,
             "log_S": log_S,
             "p_hat": p_hat,
-            "log_p_hat": torch.log(p_hat.clamp_min(1e-12)),
+            "log_p_hat": log_p_hat,
             "vacuity": vacuity,
             "evidence_total": e.sum(dim=1),
-            "logits": logits,
+            "logits": log_p_hat,
             "cos_c": cos_c,
             "d_c": d_c,
         }
@@ -149,8 +156,12 @@ class EPCHead(nn.Module):
             decisions: [B] int (class index, or -1 for UNKNOWN, or -2 for DEFER)
             confidences: [B]
         """
-        theta_unknown = theta_unknown if theta_unknown is not None else (self.theta_unknown or 0.5)
-        theta_defer = theta_defer if theta_defer is not None else (self.theta_defer or 0.1)
+        theta_unknown = theta_unknown if theta_unknown is not None else (
+            self.theta_unknown if self.theta_unknown is not None else 0.5
+        )
+        theta_defer = theta_defer if theta_defer is not None else (
+            self.theta_defer if self.theta_defer is not None else 0.1
+        )
         p = outputs["p_hat"]
         E_total = outputs["evidence_total"]
         top2 = torch.topk(p, k=2, dim=1).values
@@ -212,6 +223,7 @@ class DistanceThresholdHead(nn.Module):
         cos_c = self.prototype_bank.cosine_to_classes(z)
         logits = cos_c / 0.1  # temperature scale for compatibility
         return {
+            "z": z,
             "logits": logits,
             "p_hat": F.softmax(logits, dim=1),
             "cos_c": cos_c,

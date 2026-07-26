@@ -1,8 +1,15 @@
-"""08 — Few-shot class registration evaluation (P-FS).
+"""08 — Few-shot class registration evaluation (P-FS, table T4).
 
-Registers held-out classes from n ∈ {1, 5, 10, 20, 50} labelled samples and
-verifies the key C1 claim: register_class() changes zero model parameters
-and old-class macro-F1 delta is exactly 0.000.
+For each Protocol-B holdout set, loads the checkpoint trained with those
+classes genuinely excluded (scripts/02→05 --holdout-index i), registers each
+held-out class from n ∈ {1, 5, 10, 20, 50} labelled flows, and verifies the
+key C1 claims: registration changes ZERO existing parameters (state-dict
+diff, not a numel count) and old-class macro-F1 delta is 0.000.
+
+The n labelled flows are the held-out class's chronologically EARLIEST test
+rows (the analyst discovers the new attack early); those exact rows are
+excluded from post-registration scoring. A fresh checkpoint is loaded per
+(holdout, n) configuration so registrations never accumulate across runs.
 
 Usage:
     python scripts/08_eval_few_shot.py --dataset cicids2018
@@ -24,12 +31,11 @@ import torch
 import torch.nn.functional as F
 
 from argus.config import load_config, resolved_path
-from argus.data.splits import sample_holdout_sets
 from argus.eval.metrics import closed_set_report
 from argus.eval.continual import few_shot_report
-from argus.features.pipeline import FeaturePipeline
 from argus.graph.batching import AnchorBinGraphSource
 from argus.graph.builder import assign_node_ids
+from argus.graph.node_features import node_feature_dim
 from argus.models.argus import ArgusModel
 from argus.train.checkpoint import load_checkpoint
 from argus.train.loop import model_inputs_from_batch
@@ -55,6 +61,9 @@ def _build_source(df: pd.DataFrame, cfg, feature_names: list[str]) -> AnchorBinG
         neighbour_cap=cfg.graph.neighbour_cap,
         sampling=cfg.graph.sampling,
         strata=cfg.graph.strata,
+        te7_enabled=cfg.features.te7_enabled,
+        spectral_nbins=cfg.features.spectral_nbins,
+        spectral_min_flows=cfg.features.spectral_min_flows,
     )
 
 
@@ -83,135 +92,182 @@ def _infer_probs(
             np.concatenate(all_probs))
 
 
+def _embed_flows(model: ArgusModel, df: pd.DataFrame, cfg, feature_names: list[str],
+                 device: torch.device) -> torch.Tensor:
+    """Embed the given flows by running them through the model as their own
+    (sparse-context) anchor-bin source. Registration-time context is exactly
+    the n labelled flows the analyst has — disclosed simplification."""
+    df = df.copy()
+    df["_label_id"] = 0
+    source = _build_source(df, cfg, feature_names)
+    zs = []
+    model.eval()
+    with torch.no_grad():
+        for bin_id in source.unique_bins:
+            batch = source.build_bin_batch(bin_id, f_v=model.f_v)
+            if batch is None or batch["n_targets"] == 0:
+                continue
+            outputs = model(*model_inputs_from_batch(batch, device))
+            zs.append(outputs["z"])
+    if not zs:
+        return torch.zeros(0, 1)
+    return F.normalize(torch.cat(zs, dim=0), dim=-1)
+
+
+def _snapshot_state(model: ArgusModel) -> dict[str, torch.Tensor]:
+    return {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+
+def _zero_change_check(model: ArgusModel, before: dict[str, torch.Tensor],
+                       bank_key: str = "head.prototype_bank.bank") -> dict:
+    """State-dict diff: every pre-existing tensor must be bitwise unchanged.
+    The prototype bank may only GROW (new rows appended); its first rows must
+    be bitwise identical to before."""
+    after = model.state_dict()
+    changed = []
+    for k, v_before in before.items():
+        v_after = after.get(k)
+        if v_after is None:
+            changed.append(f"{k} (removed)")
+            continue
+        if k == bank_key:
+            p_before = v_before.shape[0]
+            if v_after.shape[0] < p_before or not torch.equal(v_after[:p_before], v_before):
+                changed.append(f"{k} (existing rows modified)")
+            continue
+        if v_after.shape != v_before.shape or not torch.equal(v_after, v_before):
+            changed.append(k)
+    return {
+        "zero_existing_param_change": len(changed) == 0,
+        "changed_tensors": changed,
+        "bank_rows_added": int(after[bank_key].shape[0] - before[bank_key].shape[0]),
+    }
+
+
 def evaluate_few_shot(
     dataset: str,
     n_shots_list: list[int] | None = None,
-    ckpt_path: str | Path | None = None,
     max_bins: int | None = None,
+    max_holdout_sets: int = 2,
 ) -> dict:
     cfg = load_config(dataset=dataset)
-    processed_dir = resolved_path(cfg, "processed_dir") / dataset
-    artifact_dir = resolved_path(cfg, "artifact_dir") / dataset
+    processed_root = resolved_path(cfg, "processed_dir") / dataset
     device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
+    repo = Path(__file__).parents[1]
 
     if n_shots_list is None:
         n_shots_list = getattr(cfg.eval, "few_shot_n", [1, 5, 10, 20, 50])
 
-    with open(artifact_dir / "feature_manifest.json") as f:
-        manifest = json.load(f)
-    feature_names = manifest["feature_names"]
-    from argus.utils.io import resolve_class_vocab
-    vocab_path = resolve_class_vocab(cfg, dataset, artifact_dir)
-    with open(vocab_path) as f:
-        class_names = json.load(f)
-
-    pipeline = FeaturePipeline.load(artifact_dir / "feature_pipeline.joblib")
-
-    # Load test data with features
-    test_df = pd.read_parquet(processed_dir / "test_features.parquet")
-    train_df = pd.read_parquet(processed_dir / "train_features.parquet")
-
-    # Load model
-    model = ArgusModel(cfg, f_e=len(feature_names), f_v=18,
-                       class_names=class_names).to(device)
-    if ckpt_path is None:
-        default_ckpt = (Path(__file__).parents[1] / cfg.run.out_dir /
-                        f"{dataset}_stage2" / "stage2_final.pt")
-        if default_ckpt.is_file():
-            ckpt_path = default_ckpt
-    if ckpt_path is not None and Path(ckpt_path).is_file():
-        print(f"[08] Loading checkpoint: {ckpt_path}")
-        load_checkpoint(ckpt_path, model, map_location=str(device))
-
-    # Measure baseline (before registration)
-    test_source = _build_source(test_df, cfg, feature_names)
-    y_true_before, y_pred_before, y_probs_before = _infer_probs(
-        model, test_source, device, max_bins=max_bins)
-    if len(y_true_before) == 0:
-        return {"status": "no_test_targets"}
-
-    before_report = closed_set_report(
-        y_true_before, y_pred_before, class_names, y_score=y_probs_before)
-    old_f1_before = before_report["per_class_f1"]
-    print(f"[08] Baseline macro-F1: {before_report['macro_f1']:.4f}")
-
-    # Determine candidate holdout classes
-    attack_classes = [c for c in class_names if c != "benign"]
-    holdout_size = min(2, len(attack_classes))
-    holdout_sets = sample_holdout_sets(
-        attack_classes, holdout_size=holdout_size, repeats=2,
-        seed=cfg.data.holdout_seed)
+    holdout_sets_path = processed_root / "holdout_sets.json"
+    if not holdout_sets_path.is_file():
+        raise FileNotFoundError(
+            f"{holdout_sets_path} not found. Run 02_build_splits.py --protocol B first."
+        )
+    with open(holdout_sets_path) as f:
+        holdout_sets = json.load(f)
+    holdout_sets = holdout_sets[:max_holdout_sets]
 
     all_few_shot_results = []
+    skipped = []
 
-    for holdout_classes in holdout_sets:
+    for idx, holdout_classes in enumerate(holdout_sets):
+        hd_processed = processed_root / f"holdout_b{idx}"
+        hd_artifacts = resolved_path(cfg, "artifact_dir") / dataset / f"holdout_b{idx}"
+        stage1_dir = repo / cfg.run.out_dir / f"{dataset}_stage1_b{idx}"
+        ckpt = repo / cfg.run.out_dir / f"{dataset}_stage2_b{idx}" / "stage2_final.pt"
+        required = [hd_processed / "test_features.parquet",
+                    hd_processed / "train_features.parquet",
+                    hd_artifacts / "feature_manifest.json",
+                    stage1_dir / "class_vocab.json", ckpt]
+        if any(not p.is_file() for p in required):
+            print(f"[08] holdout {idx} {holdout_classes}: SKIPPED — run scripts 02→05 "
+                  f"with --holdout-index {idx} first")
+            skipped.append(idx)
+            continue
+
+        with open(hd_artifacts / "feature_manifest.json") as f:
+            feature_names = json.load(f)["feature_names"]
+        with open(stage1_dir / "class_vocab.json") as f:
+            base_class_names = json.load(f)
+        label_to_id = {c: i for i, c in enumerate(base_class_names)}
+        train_counts = pd.read_parquet(
+            hd_processed / "train_features.parquet", columns=["canonical_label"]
+        )["canonical_label"].value_counts().to_dict()
+        f_v = node_feature_dim(cfg.features.te7_enabled)
+
+        test_df = pd.read_parquet(hd_processed / "test_features.parquet")
+        if "label_pre_holdout" not in test_df.columns:
+            print(f"[08] holdout {idx}: test_features lacks label_pre_holdout — rebuild "
+                  f"splits/features with current scripts (02/03) first; skipping")
+            skipped.append(idx)
+            continue
+
+        def _fresh_model() -> ArgusModel:
+            m = ArgusModel(cfg, f_e=len(feature_names), f_v=f_v,
+                           class_names=list(base_class_names),
+                           class_counts=train_counts).to(device)
+            load_checkpoint(ckpt, m, map_location=str(device))
+            return m
+
+        # Baseline (before registration): known-only rows scored against the
+        # reduced vocab.
+        known_mask = test_df["canonical_label"] != "UNKNOWN"
+        known_df = test_df[known_mask].copy()
+        known_df["_label_id"] = known_df["canonical_label"].map(label_to_id)
+        model0 = _fresh_model()
+        base_source = _build_source(known_df, cfg, feature_names)
+        y_true_b, y_pred_b, y_probs_b = _infer_probs(model0, base_source, device, max_bins=max_bins)
+        if len(y_true_b) == 0:
+            skipped.append(idx)
+            continue
+        before_report = closed_set_report(y_true_b, y_pred_b, base_class_names, y_score=y_probs_b)
+        old_f1_before = before_report["per_class_f1"]
+        print(f"[08] holdout {idx} baseline (known-only) macro-F1: {before_report['macro_f1']:.4f}")
+
         for n_shots in n_shots_list:
-            print(f"[08] Registering {holdout_classes} with n={n_shots} ...")
+            model = _fresh_model()
+            class_names = list(base_class_names)
+            state_before = _snapshot_state(model)
 
-            # Snapshot bank parameters before registration
-            params_before = sum(p.numel() for p in model.head.prototype_bank.parameters())
-
+            shot_row_ids: list[int] = []
             timer = Timer()
             timer.start()
-
             for cls_name in holdout_classes:
-                # Sample n_shots flows of this class from train
-                cls_samples = train_df[train_df["canonical_label"] == cls_name]
-                if len(cls_samples) < n_shots:
-                    print(f"[08]   {cls_name}: only {len(cls_samples)} samples")
-                    actual_n = max(1, len(cls_samples))
-                else:
-                    actual_n = n_shots
-                sampled = cls_samples.sample(n=actual_n, random_state=cfg.run.seed)
-
-                # Get embeddings: run one forward pass through the first bin
-                # to get the model's internal state, then extract embeddings
-                with torch.no_grad():
-                    bin_id = test_source.unique_bins[0]
-                    batch = test_source.build_bin_batch(bin_id, f_v=model.f_v)
-                    if batch is None:
-                        continue
-                    inputs = model_inputs_from_batch(batch, device)
-                    outputs = model(*inputs)
-                    z_all = outputs.get("z")  # [T, d_z] target edge embeddings
-
-                    # Use the first few embeddings as our "labelled" embeddings
-                    n_avail = min(actual_n, z_all.shape[0])
-                    z_labelled = F.normalize(z_all[:n_avail], dim=-1)
-
-                    # Register the new class
-                    model.head.prototype_bank.register_class(
-                        cls_name, z_labelled, n_sub=1)
-
-                    # Update class_names tracking
-                    if cls_name not in class_names:
-                        class_names.append(cls_name)
-
+                cls_rows = test_df[test_df["label_pre_holdout"] == cls_name]
+                if len(cls_rows) == 0:
+                    continue
+                shots = cls_rows.nsmallest(min(n_shots, len(cls_rows)),
+                                           "FLOW_START_MILLISECONDS")
+                shot_row_ids.extend(shots.index.tolist())
+                z = _embed_flows(model, shots, cfg, feature_names, device)
+                if z.shape[0] == 0:
+                    continue
+                model.head.prototype_bank.register_class(cls_name, z.to(device), n_sub=1)
+                if cls_name not in class_names:
+                    class_names.append(cls_name)
             reg_latency = timer.elapsed_ms()
 
-            # Verify zero parameter change
-            params_after = sum(p.numel() for p in model.head.prototype_bank.parameters())
-            param_delta = params_after - params_before  # new prototypes add params, old ones unchanged
+            change = _zero_change_check(model, state_before)
 
-            # Re-evaluate (with extended class list)
-            y_true_after, y_pred_after, y_probs_after = _infer_probs(
-                model, test_source, device, max_bins=max_bins)
+            # Post-registration scoring: everything except the shot rows.
+            eval_df = test_df.drop(index=shot_row_ids).copy()
+            ext_label_to_id = {c: i for i, c in enumerate(class_names)}
+            eval_df["_label_id"] = eval_df["label_pre_holdout"].map(
+                lambda c: ext_label_to_id.get(c, -1))
+            eval_df = eval_df[eval_df["_label_id"] >= 0]
+            eval_source = _build_source(eval_df, cfg, feature_names)
+            y_true_a, y_pred_a, y_probs_a = _infer_probs(model, eval_source, device,
+                                                         max_bins=max_bins)
+            if len(y_true_a) == 0:
+                continue
+            after_report = closed_set_report(y_true_a, y_pred_a, class_names,
+                                             y_score=y_probs_a)
 
-            # Map predictions to the extended class name list
-            after_report = closed_set_report(
-                y_true_after, np.clip(y_pred_after, 0, len(class_names) - 1),
-                class_names, y_score=y_probs_after)
-
-            # New-class F1: F1 on the newly registered holdout class
-            new_f1 = {}
-            for cls_name in holdout_classes:
-                new_f1[n_shots] = after_report["per_class_f1"].get(cls_name, 0.0)
-
-            # Old-class F1: only classes that existed before registration
-            old_f1_after = {
-                k: v for k, v in after_report["per_class_f1"].items()
-                if k in old_f1_before
-            }
+            new_f1 = {n_shots: float(np.mean([
+                after_report["per_class_f1"].get(c, 0.0) for c in holdout_classes
+            ]))}
+            old_f1_after = {k: v for k, v in after_report["per_class_f1"].items()
+                            if k in old_f1_before}
 
             fs_result = few_shot_report(
                 new_class_f1=new_f1,
@@ -220,26 +276,28 @@ def evaluate_few_shot(
                 n_shots=n_shots,
                 registration_latency_ms=reg_latency,
             )
+            fs_result["holdout_index"] = idx
             fs_result["holdout_classes"] = holdout_classes
-            fs_result["param_delta"] = param_delta
+            fs_result["per_new_class_f1"] = {
+                c: after_report["per_class_f1"].get(c, 0.0) for c in holdout_classes}
+            fs_result.update(change)
             all_few_shot_results.append(fs_result)
 
-            delta = fs_result["old_class_macro_f1_delta"]
-            print(f"[08]   n={n_shots}: new-class F1={new_f1.get(n_shots, 0):.4f}, "
-                  f"old-class delta={delta:.6f}, latency={reg_latency:.2f}ms")
+            print(f"[08]   n={n_shots}: new-class mean F1={new_f1[n_shots]:.4f}, "
+                  f"old-class delta={fs_result['old_class_macro_f1_delta']:.6f}, "
+                  f"zero-change={change['zero_existing_param_change']}, "
+                  f"latency={reg_latency:.2f}ms")
 
-    summary = {
+    return {
         "n_shots": n_shots_list,
         "results": all_few_shot_results,
-        "baseline_macro_f1": before_report["macro_f1"],
+        "skipped_holdout_indices": skipped,
     }
-    return summary
 
 
-def run(dataset: str, n_shots: list[int] | None = None, ckpt: str | None = None,
+def run(dataset: str, n_shots: list[int] | None = None,
         max_bins: int | None = None) -> None:
-    results = evaluate_few_shot(dataset, n_shots_list=n_shots, ckpt_path=ckpt,
-                                max_bins=max_bins)
+    results = evaluate_few_shot(dataset, n_shots_list=n_shots, max_bins=max_bins)
     cfg = load_config(dataset=dataset)
     out_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_few_shot"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -252,7 +310,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--n-shots", nargs="+", type=int, default=None)
-    parser.add_argument("--ckpt", default=None)
     parser.add_argument("--max-bins", type=int, default=None)
     args = parser.parse_args()
-    run(args.dataset, n_shots=args.n_shots, ckpt=args.ckpt, max_bins=args.max_bins)
+    run(args.dataset, n_shots=args.n_shots, max_bins=args.max_bins)

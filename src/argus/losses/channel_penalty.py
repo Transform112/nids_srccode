@@ -21,6 +21,9 @@ class ChannelPenaltyLoss(nn.Module):
         super().__init__()
         self.rho = rho
         self.eps = eps
+        # Mean channel-A gradient share from the most recent forward — read by
+        # gate G5 (docs/06_TRAINING.md §8) without a second backward pass.
+        self.last_ratio: float | None = None
 
     def forward(
         self,
@@ -52,4 +55,5 @@ class ChannelPenaltyLoss(nn.Module):
         denom = g_a_norm + g_b_norm + self.eps
         ratio = g_a_norm / denom
         ratio = ratio.clamp(0.0, 1.0)
+        self.last_ratio = float(ratio.mean().item())
         return torch.relu(ratio - self.rho).pow(2).mean()

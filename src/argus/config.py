@@ -106,6 +106,9 @@ SECTION_SCHEMA: dict[str, set[str]] = {
         "topk_edges", "topk_features", "ig_steps", "gnnexplainer_epochs",
         "pgexplainer_epochs", "shap_nsamples", "stability_n_perturb",
     },
+    "classes": {
+        "benign", "attacks", "canonical", "families",
+    },
 }
 
 

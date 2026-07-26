@@ -58,8 +58,15 @@ def risk_coverage_curve(
 
 
 def aurc(coverage: np.ndarray, risk: np.ndarray) -> float:
-    """Area Under the Risk–Coverage curve. Lower is better."""
-    return float(np.trapz(risk, coverage))
+    """Area Under the Risk–Coverage curve. Lower is better.
+
+    `np.trapezoid` integrates along increasing x, but `risk_coverage_curve`
+    returns `coverage` descending (100% -> 0%) — integrating as-is silently
+    flips the sign. Sort by coverage first so the result is correct
+    regardless of the input's original order.
+    """
+    order = np.argsort(coverage)
+    return float(np.trapezoid(risk[order], coverage[order]))
 
 
 def e_aurc(coverage: np.ndarray, risk: np.ndarray) -> float:
@@ -70,7 +77,8 @@ def e_aurc(coverage: np.ndarray, risk: np.ndarray) -> float:
     # Optimal: risk is monotonically decreasing from overall error to 0
     overall_error = risk[0]  # risk at coverage=1.0
     optimal_risk = overall_error * (1.0 - coverage)  # linear from overall_error to 0
-    optimal_aurc = float(np.trapz(optimal_risk, coverage))
+    order = np.argsort(coverage)
+    optimal_aurc = float(np.trapezoid(optimal_risk[order], coverage[order]))
     return aurc(coverage, risk) - optimal_aurc
 
 
