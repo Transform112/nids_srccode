@@ -50,6 +50,8 @@ class FeaturePipeline:
         self.te1_enabled = te1_enabled
         self.te2_enabled = te2_enabled
         self.include_temporal_block = include_temporal_block
+        # Same clip the TE1/TE2 conditioners apply, but for the bounded block.
+        self.clip_post_transform = clip_post_transform
         self.te1 = TE1Conditioner(
             n_quantiles=quantile_n, subsample=quantile_subsample, clip=clip_post_transform
         )
@@ -91,11 +93,23 @@ class FeaturePipeline:
             else:
                 blocks.append(df[TE1_COLUMNS].astype(float))
 
-        bounded = pd.DataFrame(
-            self.bounded_scaler.transform(df[BOUNDED_NUMERIC].fillna(0).to_numpy(dtype=float)),
-            columns=BOUNDED_NUMERIC,
-            index=df.index,
+        bounded_arr = self.bounded_scaler.transform(
+            df[BOUNDED_NUMERIC].fillna(0).to_numpy(dtype=float)
         )
+        # Clip to the same range as the TE1/TE2 conditioners. RobustScaler leaves
+        # columns whose IQR is 0 (the >75%-zeros sparse columns: DNS_QUERY_ID,
+        # ICMP_TYPE, ICMP_IPV4_TYPE, DNS_QUERY_TYPE, DNS_TTL_ANSWER) at scale_=1,
+        # i.e. a raw pass-through — DNS_QUERY_ID then reaches the model at up to
+        # 65535. Without this clip the bounded block silently escaped the ±clip
+        # bound every other numeric block obeys (see docs/BUGS.md).
+        if self.clip_post_transform is not None:
+            np.clip(
+                bounded_arr,
+                -self.clip_post_transform,
+                self.clip_post_transform,
+                out=bounded_arr,
+            )
+        bounded = pd.DataFrame(bounded_arr, columns=BOUNDED_NUMERIC, index=df.index)
         blocks.append(bounded)
 
         blocks.append(packet_size_histogram(df))

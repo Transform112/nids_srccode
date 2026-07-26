@@ -2,6 +2,12 @@
 
 Usage:
     python scripts/03_fit_features.py --dataset cicids2018
+    python scripts/03_fit_features.py --dataset cicids2018 --holdout-index 0
+
+With --holdout-index the pipeline is fit on the Protocol-B holdout-excluded
+train split (data/processed/<dataset>/holdout_b<i>/) and its artifacts land in
+data/artifacts/<dataset>/holdout_b<i>/ — the pipeline must be refit per
+holdout because its train split differs (fit-on-train-only, standing rule).
 """
 
 from __future__ import annotations
@@ -14,12 +20,13 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from argus.config import load_config, resolved_path  # noqa: E402
 from argus.features.pipeline import FeaturePipeline  # noqa: E402
+from argus.utils.io import holdout_subdir  # noqa: E402
 
 
-def run(dataset: str) -> Path:
+def run(dataset: str, holdout_index: int | None = None) -> Path:
     cfg = load_config(dataset=dataset)
-    processed_dir = resolved_path(cfg, "processed_dir") / dataset
-    artifact_dir = resolved_path(cfg, "artifact_dir") / dataset
+    processed_dir = holdout_subdir(resolved_path(cfg, "processed_dir") / dataset, holdout_index)
+    artifact_dir = holdout_subdir(resolved_path(cfg, "artifact_dir") / dataset, holdout_index)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     import pandas as pd
@@ -51,6 +58,8 @@ def run(dataset: str) -> Path:
         df = pd.read_parquet(split_path)
         transformed = pipeline.transform(df)
         transformed["canonical_label"] = df["canonical_label"].values
+        if "label_pre_holdout" in df.columns:
+            transformed["label_pre_holdout"] = df["label_pre_holdout"].values
         transformed["FLOW_START_MILLISECONDS"] = df["FLOW_START_MILLISECONDS"].values
         transformed["IPV4_SRC_ADDR"] = df["IPV4_SRC_ADDR"].values
         transformed["IPV4_DST_ADDR"] = df["IPV4_DST_ADDR"].values
@@ -66,5 +75,7 @@ def run(dataset: str) -> Path:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
+    parser.add_argument("--holdout-index", type=int, default=None,
+                        help="Protocol B: fit on holdout_b<i>'s train split instead")
     args = parser.parse_args()
-    run(args.dataset)
+    run(args.dataset, holdout_index=args.holdout_index)

@@ -87,7 +87,7 @@ Computed for node `v` over window scale `L` (300 s) unless stated:
 | 2 | `in_degree_capped` | `min(#incoming flows, K)` normalised by `K` |
 | 3 | `distinct_peers` | `log1p(#distinct peer hosts)` normalised |
 | 4 | `distinct_dst_ports` | `log1p(#distinct destination ports contacted)` normalised |
-| 5 | `fanout_ratio` | `distinct_peers / (out_degree + eps)` — scanning signature |
+| 5 | `fanout_ratio` | `distinct_peers / (out_degree + in_degree + eps)` — scanning signature, bounded in [0,1] |
 | 6 | `flow_rate` | `log1p(#flows / D_L)` |
 | 7 | `mean_log_gap` | mean of `log1p(Δt)` between consecutive flows at `v` |
 | 8 | `std_log_gap` | std. dev. of the same — regularity of arrival |

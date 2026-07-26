@@ -7,6 +7,21 @@ from __future__ import annotations
 
 import numpy as np
 
+BLOCK1_DIM = 12
+TE7_DIM = 6
+
+
+def node_feature_dim(te7_enabled: bool) -> int:
+    """F_v: 18 (12 Block-1 + 6 TE7) if TE7 is enabled, else 12.
+
+    Single source of truth for f_v — every caller that builds an
+    ``AnchorBinGraphSource`` and every caller that constructs ``ArgusModel``
+    must derive f_v this same way from ``cfg.features.te7_enabled``, or the
+    two silently disagree on tensor width whenever TE7 is toggled off (e.g.
+    the L3 temporal-ladder rung).
+    """
+    return BLOCK1_DIM + (TE7_DIM if te7_enabled else 0)
+
 
 def compute_node_features_block1(
     node_ids: np.ndarray,
@@ -41,7 +56,7 @@ def compute_node_features_block1(
     dst_ports_seen: list[set] = [set() for _ in range(v)]
     byte_vol = np.zeros(v, dtype=np.float64)
     gaps: list[list[float]] = [[] for _ in range(v)]
-    last_time: dict[int, float] = {}
+    last_time: dict[int, float] = {}  # keyed by node id — last incident flow, either direction
     short_scale_count = np.zeros(v, dtype=np.int64)
     mid_scale_count = np.zeros(v, dtype=np.int64)
 
@@ -54,18 +69,30 @@ def compute_node_features_block1(
         if si is not None:
             out_deg[si] += 1
             peers[si].add(d)
-            byte_vol[si] += b
-            if t >= mid_cutoff:
-                mid_scale_count[si] += 1
-            if t >= short_cutoff:
-                short_scale_count[si] += 1
-            if s in last_time:
-                gaps[si].append(float(t - last_time[s]))
-            last_time[s] = t
+            dst_ports_seen[si].add(d)  # placeholder; real dst port tracked upstream
         if di is not None:
             in_deg[di] += 1
             peers[di].add(s)
-            dst_ports_seen[di].add(d)  # placeholder; real dst port tracked upstream
+
+        # byte_volume / short_scale_burst / gap features are defined over
+        # ALL incident flows (docs/04_GRAPH_CONSTRUCTION.md §3.1: "total
+        # bytes across incident flows"; short_scale_burst is a general burst
+        # detector) — restricting these to the source side left them at ~0
+        # for a node that is purely a flood/scan *target*, i.e. dead for
+        # exactly the attack pattern they exist to catch. `touched` dedupes
+        # the rare src==dst self-loop case so it isn't double-counted.
+        touched = {s: si, d: di} if s != d else {s: si}
+        for node_id, node_idx in touched.items():
+            if node_idx is None:
+                continue
+            byte_vol[node_idx] += b
+            if t >= mid_cutoff:
+                mid_scale_count[node_idx] += 1
+            if t >= short_cutoff:
+                short_scale_count[node_idx] += 1
+            if node_id in last_time:
+                gaps[node_idx].append(float(t - last_time[node_id]))
+            last_time[node_id] = t
 
     for i, nid in enumerate(node_ids):
         od, idg = out_deg[i], in_deg[i]
@@ -73,7 +100,16 @@ def compute_node_features_block1(
         out[i, 1] = min(idg, k_cap) / k_cap
         out[i, 2] = np.log1p(len(peers[i])) / np.log1p(max(k_cap, 2))
         out[i, 3] = np.log1p(len(dst_ports_seen[i])) / np.log1p(max(k_cap, 2))
-        out[i, 4] = len(peers[i]) / (od + 1e-6)
+        # fanout_ratio (docs/04 §3.1 feature 5): distinct peers per incident
+        # flow. Normalised by TOTAL degree (out+in), not out-degree alone, so
+        # it stays bounded in [0, 1] — every distinct peer comes from an
+        # incident edge, so len(peers) <= od + idg. Dividing by (od + eps)
+        # exploded to ~1e6 for pure-destination nodes (od=0), which are exactly
+        # scan/flood victims; that single unbounded column swamped every other
+        # (O(1)) node feature and collapsed the encoder embeddings. This form
+        # honours the file-wide invariant "every Block-1 feature is
+        # degree-capped or log-compressed" (docs/04 §3.1).
+        out[i, 4] = len(peers[i]) / (od + idg + 1e-6)
         out[i, 5] = np.log1p(od / d_l)
         g = gaps[i]
         if g:
