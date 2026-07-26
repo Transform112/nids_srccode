@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from argus.models.aggregation import RobustAggregator
 from argus.models.attention import TimeDecayedAttention
-from argus.models.norm import make_norm
+from argus.models.norm import GraphNorm, make_norm
 from argus.models.time_encoding import Time2Vec
 
 
@@ -144,6 +144,11 @@ class SRTEGLayer(nn.Module):
         # value, numerics, or gradients when disabled.
         self.record_attention = False
         self.last_attn: dict[int, torch.Tensor] = {}
+        # Opt-in side channel for edge-level attribution (docs/11_XAI.md §1.2):
+        # retains the [N, K, d_h] message tensor and its grad so attr_edge can
+        # read ∂(score)/∂m_{n→v} after a backward pass. Off by default.
+        self.record_messages = False
+        self.last_msgs: torch.Tensor | None = None
 
     def forward(
         self,
@@ -170,49 +175,77 @@ class SRTEGLayer(nn.Module):
         msg_input = torch.cat([src_state, neigh_attr, time_enc], dim=-1)  # [N, K, d_h+d_h+d_t]
         msgs = self.msg_mlp(msg_input)  # [N, K, d_h]
 
+        if self.record_messages and msgs.requires_grad:
+            msgs.retain_grad()
+            self.last_msgs = msgs
+
         if self.record_attention:
             self.last_attn = {}
 
-        # Per-node attention + aggregation
-        out = torch.zeros_like(x)
-        for v in range(n):
-            m = mask[v]
-            if not m.any():
-                continue
-            node_msgs = msgs[v, m]  # [n_v, d_h]
-            query = x[v]  # [d_h]
-            dt = neigh_dt[v, m]  # [n_v]
-            n_v = node_msgs.shape[0]
-            if self.te4_enabled:
-                # Compute time-decayed attention weights using the module parameters.
-                q = self.attn.W_Q(query).view(self.attn.heads, self.attn.d_k)  # [H, d_k]
-                k = self.attn.W_K(node_msgs).view(n_v, self.attn.heads, self.attn.d_k)
-                scores = torch.einsum("hd,nhd->nh", q, k) / math.sqrt(self.attn.d_k)
-                lambdas = F.softplus(self.attn.lambda_hat)
-                decay = -(lambdas.unsqueeze(0) * dt.unsqueeze(-1))
-                attn = F.softmax(scores + decay, dim=0)  # [n_v, H]
-                # Aggregate messages per head then concatenate.
-                head_msgs = torch.einsum("nh,nhd->hd", attn, k).reshape(self.attn.d_h)
-                attended = self.attn.W_O(head_msgs)
-                # Derive a single weight vector per message for the robust aggregator
-                # by averaging the multi-head attention weights.
-                weights = attn.mean(dim=1)  # [n_v]
-            else:
-                attended = node_msgs.mean(dim=0)
-                weights = torch.full(
-                    (n_v,), 1.0 / n_v, device=x.device, dtype=x.dtype
-                )
-            if self.record_attention:
-                self.last_attn[v] = weights.detach()
-            # Robust aggregator uses raw messages with the attention-derived weights.
-            # The attended value is ignored in favour of the trimmed-mean aggregate,
-            # keeping the breakdown-point argument valid.
-            agg = self.aggregator(node_msgs, weights)  # [d_h]
-            out[v] = agg
+        # Attention + aggregation for every node at once.
+        #
+        # This was a `for v in range(n)` loop issuing a handful of tiny CUDA
+        # ops per node. At ~8.25 ms/node and ~1.22 M node-iterations per
+        # CICIDS2018 epoch it cost ~3 h/epoch — 30 epochs would not fit in
+        # eight 12 h Kaggle sessions (docs/BUGS.md #48). Everything it did is
+        # expressible on the dense [N, K, ·] tensors the layer already builds,
+        # so the whole thing is one batched pass; `tests/test_vectorised_layer.py`
+        # asserts output equivalence with the original loop.
+        n_valid = mask.sum(dim=1)  # [N]
+        if self.te4_enabled:
+            # Normalised by scale duration, matching time_enc's Δt/D_s
+            # (docs/05_ARCHITECTURE.md §3.4) — lambda_hat is initialised
+            # assuming a normalised [0,1]-ish Δt range (SRTEGLayer is always
+            # constructed with scale_duration=1.0, since weights are shared
+            # across scales; layer.attn.scale_duration is the *real* D_s,
+            # reassigned per scale by forward_scale()). Using raw-second dt
+            # here instead made mid/long-scale decay collapse to a
+            # near-hard most-recent-edge pick (e.g. -1109 nats at dt=100s).
+            dt = neigh_dt / self.attn.scale_duration  # [N, K]
+            h, d_k = self.attn.heads, self.attn.d_k
+            q = self.attn.W_Q(x).view(n, h, d_k)  # [N, H, d_k]
+            k_proj = self.attn.W_K(msgs).view(n, k, h, d_k)  # [N, K, H, d_k]
+            scores = torch.einsum("nhd,nkhd->nkh", q, k_proj) / math.sqrt(d_k)
+            lambdas = F.softplus(self.attn.lambda_hat)  # [H]
+            decay = -(lambdas.view(1, 1, h) * dt.unsqueeze(-1))  # [N, K, H]
+            # Softmax runs over the neighbour axis and must see only valid
+            # neighbours. A finite sentinel (not -inf) keeps all-masked rows —
+            # isolated nodes — finite instead of NaN; their weights are zeroed
+            # immediately below and the aggregator returns a zero row for them.
+            logits = (scores + decay).masked_fill(~mask.unsqueeze(-1), -1e30)
+            attn = F.softmax(logits, dim=1)  # [N, K, H]
+            # One weight per message for the robust aggregator: mean over heads.
+            weights = attn.mean(dim=-1).masked_fill(~mask, 0.0)  # [N, K]
+            # NOTE: the old loop also computed `attended = W_O(...)` here and
+            # discarded it (the trimmed-mean aggregate is used instead, keeping
+            # the breakdown-point argument valid). It fed nothing downstream and
+            # therefore received no gradient, so it is simply not computed now.
+            # `self.attn.W_O` remains defined so checkpoints stay loadable.
+        else:
+            inv = torch.where(n_valid > 0, 1.0 / n_valid.to(x.dtype), torch.zeros_like(x[:, 0]))
+            weights = mask.to(x.dtype) * inv.unsqueeze(-1)  # [N, K]
 
-        # Node update: pre-norm residual
+        if self.record_attention:
+            # XAI side channel keeps its per-node view (valid neighbours only).
+            # Only built when explicitly enabled, so training pays nothing.
+            self.last_attn = {
+                v: weights[v, mask[v]].detach()
+                for v in range(n)
+                if bool(mask[v].any())
+            }
+
+        # Robust aggregator over raw messages with the attention-derived weights.
+        out = self.aggregator.forward_batched(msgs, weights, mask)  # [N, d_h]
+
+        # Node update: pre-norm residual. Only GraphNorm consumes `batch`;
+        # LayerNorm/RMSNorm take x alone, so passing batch to them crashed the
+        # norm_node=layernorm / rmsnorm ablations (TypeError: forward() takes 2
+        # positional arguments but 3 were given).
         concat = torch.cat([x, out], dim=-1)
-        concat = self.upd_norm(concat, batch)
+        if isinstance(self.upd_norm, GraphNorm):
+            concat = self.upd_norm(concat, batch)
+        else:
+            concat = self.upd_norm(concat)
         upd = self.upd_mlp(concat)
         return x + self.drop_path(upd)
 
