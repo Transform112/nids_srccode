@@ -104,6 +104,10 @@ def train_stage1(
             {"epoch": epoch, "train_loss": train_result.loss, "train_acc": train_result.accuracy,
              "val_loss": val_result.loss, "val_acc": val_result.accuracy}
         )
+        print(f"[04] Epoch {epoch:2d}/{cfg.train.stage1_epochs}  "
+              f"train_loss={train_result.loss:.4f}  val_loss={val_result.loss:.4f}  "
+              f"val_acc={val_result.accuracy:.4f}  "
+              f"{'*' if val_result.accuracy > best_val else ''}{'patience=' + str(patience_left) if val_result.accuracy <= best_val else ''}")
         if val_result.accuracy > best_val:
             best_val = val_result.accuracy
             patience_left = cfg.train.stage1_patience

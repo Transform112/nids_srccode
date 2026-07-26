@@ -123,6 +123,11 @@ def train_stage2(
             {"epoch": epoch, "train_loss": train_result.loss, "train_acc": train_result.accuracy,
              "val_loss": val_result.loss, "val_acc": val_result.accuracy}
         )
+        print(f"[05] Epoch {epoch:2d}/{cfg.train.stage2_epochs}  "
+              f"train_loss={train_result.loss:.4f}  val_loss={val_result.loss:.4f}  "
+              f"val_acc={val_result.accuracy:.4f}  "
+              f"tau={model.head.tau.item():.3f}  "
+              f"{'*' if val_result.accuracy > best_val else f'patience={patience_left}'}")
         if val_result.accuracy > best_val:
             best_val = val_result.accuracy
             patience_left = cfg.train.stage2_patience
