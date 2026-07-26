@@ -1,23 +1,26 @@
-"""03 — Precompute graph batch cache with multiprocessing.
+"""03 — Precompute graph batch cache (single-process, compressed).
 
-Builds all anchor-bin batches for train/val/test splits in parallel across
-all CPU cores and serialises them to disk as ``.pt`` files.  Training scripts
-then replay from cache at ~50 ms/bin instead of rebuilding at ~5 sec/bin.
+Builds anchor-bin batches for train/val/test splits and serialises them
+as compressed ``.pt.gz`` files.  Training scripts then replay from cache at
+~50 ms/bin instead of rebuilding at ~4 sec/bin.
 
-This is the difference between a 100-hour first epoch and a 30-second epoch.
+Single-process avoids PyTorch multiprocessing race conditions.  gzip
+compression cuts disk usage ~3× (6 GB → 2 GB for a typical split).
 
 Usage:
     python scripts/03_cache_graphs.py --dataset cicids2018
     python scripts/03_cache_graphs.py --dataset cicids2018 --splits train val
-    python scripts/03_cache_graphs.py --dataset cicids2018 --workers 8
+    python scripts/03_cache_graphs.py --dataset cicids2018 \\
+        --set graph.anchor_bin_seconds=10 --set graph.window_short_seconds=10
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import sys
-from multiprocessing import Pool, cpu_count
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -30,41 +33,26 @@ from argus.config import load_config, resolved_path
 from argus.graph.batching import AnchorBinGraphSource
 from argus.graph.builder import assign_node_ids
 
-# Global refs for worker processes (avoids re-serialising the source per bin).
-_worker_source: AnchorBinGraphSource | None = None
-_worker_cache_dir: Path | None = None
-_worker_f_v: int = 18
+
+def _save_compressed(obj: dict, path: Path) -> None:
+    """torch.save → gzip for 3× smaller cache files."""
+    tmp = path.with_suffix(".tmp")
+    torch.save(obj, tmp)
+    with open(tmp, "rb") as fin, gzip.open(path, "wb", compresslevel=3) as fout:
+        fout.write(fin.read())
+    tmp.unlink()
 
 
-def _init_worker(source: AnchorBinGraphSource, cache_dir: Path, f_v: int) -> None:
-    global _worker_source, _worker_cache_dir, _worker_f_v
-    _worker_source = source
-    _worker_cache_dir = cache_dir
-    _worker_f_v = f_v
-
-
-def _build_one(bin_id: int) -> tuple[int, bool, str]:
-    """Build + save one bin. Returns (bin_id, success, error_msg)."""
-    global _worker_source, _worker_cache_dir, _worker_f_v
-    cache_path = _worker_cache_dir / f"bin_{bin_id:06d}.pt"
-    if cache_path.exists():
-        return (bin_id, True, "skip")
-    try:
-        batch = _worker_source.build_bin_batch(bin_id, _worker_f_v)
-        if batch is not None:
-            torch.save(batch, cache_path)
-            return (bin_id, True, "ok")
-        else:
-            return (bin_id, True, "empty")
-    except Exception as e:
-        return (bin_id, False, str(e))
+def _load_compressed(path: Path) -> dict:
+    """gzip → torch.load counterpart."""
+    with gzip.open(path, "rb") as fin:
+        return torch.load(fin, weights_only=False)
 
 
 def build_source(
     processed_dir: Path, split: str, cfg, feature_names: list[str],
     label_to_id: dict[str, int] | None = None,
 ) -> AnchorBinGraphSource:
-    """Build a fresh AnchorBinGraphSource for one split (worker-compatible)."""
     df = pd.read_parquet(processed_dir / f"{split}_features.parquet")
     df = df.sort_values("FLOW_START_MILLISECONDS").reset_index(drop=True)
     if label_to_id is not None:
@@ -92,7 +80,6 @@ def build_source(
 def run(
     dataset: str,
     splits: list[str] | None = None,
-    workers: int | None = None,
     overrides: list[str] | None = None,
 ) -> dict:
     cfg = load_config(dataset=dataset, model="argus", overrides=overrides)
@@ -103,11 +90,9 @@ def run(
         manifest = json.load(f)
     feature_names = manifest["feature_names"]
 
-    # Try to load class_vocab; build label_to_id if available.
     label_to_id = None
-    vocab_path = artifact_dir / "class_vocab.json"
     stage1_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_stage1"
-    for p in [stage1_dir / "class_vocab.json", vocab_path]:
+    for p in [stage1_dir / "class_vocab.json", artifact_dir / "class_vocab.json"]:
         if p.is_file():
             with open(p) as f:
                 class_names = json.load(f)
@@ -115,47 +100,72 @@ def run(
             break
 
     if splits is None:
-        splits = ["train", "val", "test"]
-    if workers is None:
-        workers = max(1, cpu_count() - 2)
+        splits = ["train", "val"]
 
-    out_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_stage1" / "cache"
+    cache_root = stage1_dir / "cache"
     report: dict[str, dict] = {}
 
     for split in splits:
+        t_start = time.perf_counter()
         print(f"[03] Building source for {split} ...")
         source = build_source(processed_dir, split, cfg, feature_names, label_to_id)
-        split_cache = out_dir / split
+        split_cache = cache_root / split
         split_cache.mkdir(parents=True, exist_ok=True)
         bins = source.unique_bins
         n_bins = len(bins)
-        print(f"[03] {split}: {n_bins} bins, {workers} workers")
+        print(f"[03] {split}: {n_bins} bins  |  anchor={cfg.graph.anchor_bin_seconds}s  "
+              f"windows=({cfg.graph.window_short_seconds}/{cfg.graph.window_mid_seconds}/"
+              f"{cfg.graph.window_long_seconds})s  |  K={cfg.graph.neighbour_cap}")
 
-        # Multiprocessing precompute
         built = 0
         skipped = 0
         errors = 0
-        with Pool(processes=workers, initializer=_init_worker,
-                  initargs=(source, split_cache, 18)) as pool:
-            for i, (bin_id, ok, status) in enumerate(
-                pool.imap_unordered(_build_one, bins, chunksize=10)
-            ):
-                if ok and status == "skip":
-                    skipped += 1
-                elif ok:
-                    built += 1
-                else:
+        build_time = 0.0
+        last_log = t_start
+
+        for i, bin_id in enumerate(bins):
+            cache_path = split_cache / f"bin_{bin_id:06d}.pt.gz"
+            if cache_path.exists():
+                skipped += 1
+                # Remove stale uncompressed .pt files from previous broken runs
+                old_path = split_cache / f"bin_{bin_id:06d}.pt"
+                if old_path.exists():
+                    old_path.unlink()
+            else:
+                t_bin = time.perf_counter()
+                try:
+                    batch = source.build_bin_batch(bin_id, f_v=18)
+                    if batch is not None:
+                        _save_compressed(batch, cache_path)
+                        built += 1
+                    else:
+                        skipped += 1
+                except Exception as e:
                     errors += 1
-                    print(f"[03]   ERROR bin {bin_id}: {status}")
-                if (i + 1) % 1000 == 0:
-                    pct = (i + 1) / n_bins * 100
-                    print(f"[03]   {split} {i + 1}/{n_bins} bins ({pct:.0f}%)  "
-                          f"built={built}  skip={skipped}  err={errors}", flush=True)
+                    if errors <= 5:
+                        print(f"[03]   ERROR bin {bin_id}: {e}", flush=True)
+                build_time += time.perf_counter() - t_bin
 
-        report[split] = {"bins": n_bins, "built": built, "skipped": skipped, "errors": errors}
-        print(f"[03] {split} done: {built} built, {skipped} skipped, {errors} errors")
+            # Progress every 500 bins or 30 seconds
+            elapsed = time.perf_counter() - last_log
+            if (i + 1) % 500 == 0 or elapsed > 30:
+                pct = (i + 1) / n_bins * 100
+                rate = (i + 1 - skipped) / max(time.perf_counter() - t_start, 1)
+                eta_min = (n_bins - i - 1) / max(rate, 0.001) / 60
+                print(f"[03]   {split} {i + 1}/{n_bins} bins ({pct:.0f}%)  "
+                      f"built={built}  skip={skipped}  err={errors}  "
+                      f"ETA={eta_min:.0f}min", flush=True)
+                last_log = time.perf_counter()
 
-    print(f"[03] Cache saved to {out_dir}")
+        elapsed_m = (time.perf_counter() - t_start) / 60
+        disk_mb = sum(f.stat().st_size for f in split_cache.glob("*.pt.gz")) / (1024**2)
+        report[split] = {"bins": n_bins, "built": built, "skipped": skipped,
+                         "errors": errors, "elapsed_min": round(elapsed_m, 1),
+                         "disk_mb": round(disk_mb, 1)}
+        print(f"[03] {split} done: {built} built, {errors} errors, "
+              f"{elapsed_m:.0f}min, {disk_mb:.0f}MB on disk")
+
+    print(f"[03] Cache saved to {cache_root}")
     return report
 
 
@@ -163,7 +173,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--splits", nargs="+", default=None)
-    parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--set", action="append", default=[], dest="overrides")
     args = parser.parse_args()
-    run(args.dataset, splits=args.splits, workers=args.workers, overrides=args.overrides)
+    run(args.dataset, splits=args.splits, overrides=args.overrides)

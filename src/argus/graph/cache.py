@@ -66,11 +66,20 @@ class CachedGraphSource:
 
     # -- main API -------------------------------------------------------------
     def build_bin_batch(self, bin_id: int, f_v: int = 18) -> dict | None:
-        cache_path = self._cache_dir / f"bin_{bin_id:06d}.pt"
+        # Prefer compressed cache (03_cache_graphs.py), fall back to uncompressed
+        cache_gz = self._cache_dir / f"bin_{bin_id:06d}.pt.gz"
+        cache_pt = self._cache_dir / f"bin_{bin_id:06d}.pt"
 
-        if cache_path.exists():
+        if cache_gz.exists():
             t0 = time.perf_counter()
-            batch = torch.load(cache_path, weights_only=False)
+            import gzip
+            with gzip.open(cache_gz, "rb") as f:
+                batch = torch.load(f, weights_only=False)
+            self._load_time_ms += (time.perf_counter() - t0) * 1000
+            self._hits += 1
+        elif cache_pt.exists():
+            t0 = time.perf_counter()
+            batch = torch.load(cache_pt, weights_only=False)
             self._load_time_ms += (time.perf_counter() - t0) * 1000
             self._hits += 1
         else:
@@ -79,7 +88,7 @@ class CachedGraphSource:
             self._build_time_ms += (time.perf_counter() - t0) * 1000
             self._misses += 1
             if batch is not None:
-                torch.save(batch, cache_path)
+                torch.save(batch, cache_pt)
 
         if (self._hits + self._misses) % self._log_every == 0:
             total = self._hits + self._misses
