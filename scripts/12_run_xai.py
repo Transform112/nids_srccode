@@ -70,7 +70,9 @@ def run(dataset: str, n_samples: int = 10, overrides: list[str] | None = None, s
     feature_names = manifest["feature_names"]
     f_e = manifest["f_e"]
 
-    with open(artifact_dir / "class_vocab.json") as f:
+    from argus.utils.io import resolve_class_vocab
+    vocab_path = resolve_class_vocab(cfg, dataset, artifact_dir)
+    with open(vocab_path) as f:
         class_names = json.load(f)
     label_to_id = {c: i for i, c in enumerate(class_names)}
 

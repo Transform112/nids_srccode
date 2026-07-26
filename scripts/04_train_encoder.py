@@ -29,11 +29,16 @@ from argus.train.checkpoint import save_checkpoint  # noqa: E402
 from argus.train.stage1_encoder import train_stage1  # noqa: E402
 
 
-def _load_source(processed_dir: Path, split: str, cfg, feature_names: list[str]) -> AnchorBinGraphSource:
+def _load_source(processed_dir: Path, split: str, cfg, feature_names: list[str],
+                 label_to_id: dict[str, int] | None = None) -> AnchorBinGraphSource:
     import pandas as pd
 
     df = pd.read_parquet(processed_dir / f"{split}_features.parquet")
     df = df.sort_values("FLOW_START_MILLISECONDS").reset_index(drop=True)
+
+    # Add _label_id in-memory — avoids writing back to parquet (Kaggle mounts are read-only).
+    if label_to_id is not None:
+        df["_label_id"] = df["canonical_label"].map(label_to_id)
 
     src_ids, dst_ids, _ = assign_node_ids(
         df, node_granularity=cfg.graph.node_granularity,
@@ -76,16 +81,22 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     train_df = pd.read_parquet(processed_dir / "train_features.parquet")
     class_names = sorted(train_df["canonical_label"].unique().tolist())
     label_to_id = {c: i for i, c in enumerate(class_names)}
-    with open(artifact_dir / "class_vocab.json", "w") as f:
+
+    # Write class_vocab to run_dir (always writable, even on Kaggle read-only mounts).
+    run_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_stage1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with open(run_dir / "class_vocab.json", "w") as f:
         json.dump(class_names, f, indent=2)
+    # Also try artifact_dir (local dev); ignore if read-only (Kaggle).
+    try:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        with open(artifact_dir / "class_vocab.json", "w") as f:
+            json.dump(class_names, f, indent=2)
+    except OSError:
+        pass  # Kaggle read-only mount — run_dir copy is canonical
 
-    for split in ("train", "val"):
-        df = pd.read_parquet(processed_dir / f"{split}_features.parquet")
-        df["_label_id"] = df["canonical_label"].map(label_to_id)
-        df.to_parquet(processed_dir / f"{split}_features.parquet", index=False)
-
-    train_source = _load_source(processed_dir, "train", cfg, feature_names)
-    val_source = _load_source(processed_dir, "val", cfg, feature_names)
+    train_source = _load_source(processed_dir, "train", cfg, feature_names, label_to_id)
+    val_source = _load_source(processed_dir, "val", cfg, feature_names, label_to_id)
 
     device = torch.device(cfg.run.device if torch.cuda.is_available() or cfg.run.device == "cpu" else "cpu")
     torch.manual_seed(cfg.run.seed)
@@ -100,8 +111,6 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     result = train_stage1(model, train_source, val_source, cfg, device, max_bins=max_bins)
     print(f"[04] Stage 1 best val accuracy proxy: {result['best_val_acc']:.4f}")
 
-    run_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_stage1"
-    run_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = run_dir / "stage1_final.pt"
     save_checkpoint(ckpt_path, model, torch.optim.AdamW(model.parameters()), epoch=len(result["history"]))
     with open(run_dir / "stage1_history.json", "w") as f:

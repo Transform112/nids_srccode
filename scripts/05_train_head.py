@@ -44,15 +44,22 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     feature_names = manifest["feature_names"]
     f_e = manifest["f_e"]
 
-    with open(artifact_dir / "class_vocab.json") as f:
+    # Load class_vocab from run_dir (Kaggle) or artifact_dir (local dev).
+    stage1_run_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_stage1"
+    vocab_path = stage1_run_dir / "class_vocab.json"
+    if not vocab_path.is_file():
+        vocab_path = artifact_dir / "class_vocab.json"
+    with open(vocab_path) as f:
         class_names = json.load(f)
+
+    label_to_id = {c: i for i, c in enumerate(class_names)}
 
     import pandas as pd
     train_df = pd.read_parquet(processed_dir / "train_features.parquet")
     class_counts = train_df["canonical_label"].value_counts().to_dict()
 
-    train_source = _load_source(processed_dir, "train", cfg, feature_names)
-    val_source = _load_source(processed_dir, "val", cfg, feature_names)
+    train_source = _load_source(processed_dir, "train", cfg, feature_names, label_to_id)
+    val_source = _load_source(processed_dir, "val", cfg, feature_names, label_to_id)
 
     device = torch.device(cfg.run.device if torch.cuda.is_available() or cfg.run.device == "cpu" else "cpu")
     torch.manual_seed(cfg.run.seed)

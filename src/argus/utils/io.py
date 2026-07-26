@@ -68,3 +68,35 @@ def save_numpy(array: np.ndarray, path: str | Path) -> None:
 def load_numpy(path: str | Path) -> np.ndarray:
     """Load a NumPy array from disk."""
     return np.load(path)
+
+
+def resolve_class_vocab(cfg: Any, dataset: str, artifact_dir: Path) -> Path:
+    """Resolve class_vocab.json, preferring the Stage-1 run directory.
+
+    On Kaggle the artifact directory (input mount) is read-only, so
+    ``04_train_encoder`` writes ``class_vocab.json`` to its run_dir.
+    This helper checks that location first, then falls back to the
+    artifact directory for local dev runs.
+
+    Args:
+        cfg: resolved OmegaConf config.
+        dataset: dataset name (e.g. ``"cicids2018"``).
+        artifact_dir: ``resolved_path(cfg, "artifact_dir") / dataset``.
+
+    Returns:
+        Path to the class_vocab.json file that exists.
+    """
+    from pathlib import Path
+
+    stage1_dir = Path(__file__).parents[2] / cfg.run.out_dir / f"{dataset}_stage1"
+    run_copy = stage1_dir / "class_vocab.json"
+    artifact_copy = artifact_dir / "class_vocab.json"
+
+    if run_copy.is_file():
+        return run_copy
+    if artifact_copy.is_file():
+        return artifact_copy
+    raise FileNotFoundError(
+        f"class_vocab.json not found in {stage1_dir} or {artifact_dir}. "
+        f"Run scripts/04_train_encoder.py first."
+    )

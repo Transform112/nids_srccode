@@ -81,7 +81,9 @@ def evaluate_transfer(
         manifest = json.load(f)
     feature_names = manifest["feature_names"]
 
-    with open(src_artifact_dir / "class_vocab.json") as f:
+    from argus.utils.io import resolve_class_vocab
+    vocab_path = resolve_class_vocab(src_cfg, source_dataset, src_artifact_dir)
+    with open(vocab_path) as f:
         source_class_names = json.load(f)
 
     # Target data

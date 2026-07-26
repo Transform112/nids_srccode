@@ -142,7 +142,11 @@ def run(
     train_df = pd.read_parquet(processed_dir / "train_features.parquet")
     test_df = pd.read_parquet(processed_dir / "test_features.parquet")
 
-    class_vocab_path = artifact_dir / "class_vocab.json"
+    from argus.utils.io import resolve_class_vocab
+    try:
+        class_vocab_path = resolve_class_vocab(cfg, dataset, artifact_dir)
+    except FileNotFoundError:
+        class_vocab_path = artifact_dir / "class_vocab.json"
     if class_vocab_path.exists():
         with open(class_vocab_path) as f:
             class_names = json.load(f)

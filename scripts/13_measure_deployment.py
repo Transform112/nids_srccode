@@ -37,7 +37,9 @@ def run(dataset: str, n_flows: int = 2000, overrides: list[str] | None = None) -
         manifest = json.load(f)
     feature_names = manifest["feature_names"]
     f_e = manifest["f_e"]
-    with open(artifact_dir / "class_vocab.json") as f:
+    from argus.utils.io import resolve_class_vocab
+    vocab_path = resolve_class_vocab(cfg, dataset, artifact_dir)
+    with open(vocab_path) as f:
         class_names = json.load(f)
 
     feat_test = pd.read_parquet(processed_dir / "test_features.parquet")

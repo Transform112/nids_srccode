@@ -41,7 +41,9 @@ def evaluate_closed_set(dataset: str, ckpt_path: str | Path | None = None) -> di
         manifest = json.load(f)
     feature_names = manifest["feature_names"]
 
-    with open(artifact_dir / "class_vocab.json") as f:
+    from argus.utils.io import resolve_class_vocab
+    vocab_path = resolve_class_vocab(cfg, dataset, artifact_dir)
+    with open(vocab_path) as f:
         class_names = json.load(f)
 
     # Build test source
