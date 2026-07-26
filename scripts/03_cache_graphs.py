@@ -17,7 +17,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import sys
 import time
@@ -27,36 +26,22 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 import numpy as np
 import pandas as pd
-import torch
 
 from argus.config import load_config, resolved_path
 from argus.graph.batching import AnchorBinGraphSource
 from argus.graph.builder import assign_node_ids
-
-
-def _save_compressed(obj: dict, path: Path) -> None:
-    """torch.save → gzip for 3× smaller cache files."""
-    tmp = path.with_suffix(".tmp")
-    torch.save(obj, tmp)
-    with open(tmp, "rb") as fin, gzip.open(path, "wb", compresslevel=3) as fout:
-        fout.write(fin.read())
-    tmp.unlink()
-
-
-def _load_compressed(path: Path) -> dict:
-    """gzip → torch.load counterpart."""
-    with gzip.open(path, "rb") as fin:
-        return torch.load(fin, weights_only=False)
+from argus.graph.cache import _save_compressed, verify_or_write_cache_meta
+from argus.graph.node_features import node_feature_dim
+from argus.utils.io import derive_class_vocab, holdout_subdir, run_suffix
 
 
 def build_source(
     processed_dir: Path, split: str, cfg, feature_names: list[str],
-    label_to_id: dict[str, int] | None = None,
+    label_to_id: dict[str, int],
 ) -> AnchorBinGraphSource:
     df = pd.read_parquet(processed_dir / f"{split}_features.parquet")
     df = df.sort_values("FLOW_START_MILLISECONDS").reset_index(drop=True)
-    if label_to_id is not None:
-        df["_label_id"] = df["canonical_label"].map(label_to_id)
+    df["_label_id"] = df["canonical_label"].map(label_to_id)
 
     src_ids, dst_ids, _ = assign_node_ids(
         df, node_granularity=cfg.graph.node_granularity,
@@ -74,6 +59,9 @@ def build_source(
         neighbour_cap=cfg.graph.neighbour_cap,
         sampling=cfg.graph.sampling,
         strata=cfg.graph.strata,
+        te7_enabled=cfg.features.te7_enabled,
+        spectral_nbins=cfg.features.spectral_nbins,
+        spectral_min_flows=cfg.features.spectral_min_flows,
     )
 
 
@@ -81,24 +69,30 @@ def run(
     dataset: str,
     splits: list[str] | None = None,
     overrides: list[str] | None = None,
+    holdout_index: int | None = None,
 ) -> dict:
     cfg = load_config(dataset=dataset, model="argus", overrides=overrides)
-    processed_dir = resolved_path(cfg, "processed_dir") / dataset
-    artifact_dir = resolved_path(cfg, "artifact_dir") / dataset
+    processed_dir = holdout_subdir(resolved_path(cfg, "processed_dir") / dataset, holdout_index)
+    artifact_dir = holdout_subdir(resolved_path(cfg, "artifact_dir") / dataset, holdout_index)
 
     with open(artifact_dir / "feature_manifest.json") as f:
         manifest = json.load(f)
     feature_names = manifest["feature_names"]
 
-    label_to_id = None
-    stage1_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_stage1"
-    for p in [stage1_dir / "class_vocab.json", artifact_dir / "class_vocab.json"]:
-        if p.is_file():
-            with open(p) as f:
-                class_names = json.load(f)
-            label_to_id = {c: i for i, c in enumerate(class_names)}
-            break
+    # Derive class vocab directly from data — do NOT read a persisted
+    # class_vocab.json here. This script is meant to run *before*
+    # 04_train_encoder.py (CPU cache-build session ahead of GPU training),
+    # so that file won't exist yet on a fresh Kaggle session. Deriving it
+    # the same way 04 does guarantees identical label ids either way.
+    train_labels_df = pd.read_parquet(
+        processed_dir / "train_features.parquet", columns=["canonical_label"]
+    )
+    class_names = derive_class_vocab(train_labels_df)
+    label_to_id = {c: i for i, c in enumerate(class_names)}
+    f_v = node_feature_dim(cfg.features.te7_enabled)
 
+    stage1_dir = (Path(__file__).parents[1] / cfg.run.out_dir
+                  / f"{dataset}_stage1{run_suffix(holdout_index)}")
     if splits is None:
         splits = ["train", "val"]
 
@@ -110,7 +104,7 @@ def run(
         print(f"[03] Building source for {split} ...")
         source = build_source(processed_dir, split, cfg, feature_names, label_to_id)
         split_cache = cache_root / split
-        split_cache.mkdir(parents=True, exist_ok=True)
+        verify_or_write_cache_meta(split_cache, cfg)
         bins = source.unique_bins
         n_bins = len(bins)
         print(f"[03] {split}: {n_bins} bins  |  anchor={cfg.graph.anchor_bin_seconds}s  "
@@ -134,7 +128,7 @@ def run(
             else:
                 t_bin = time.perf_counter()
                 try:
-                    batch = source.build_bin_batch(bin_id, f_v=18)
+                    batch = source.build_bin_batch(bin_id, f_v=f_v)
                     if batch is not None:
                         _save_compressed(batch, cache_path)
                         built += 1
@@ -174,5 +168,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--splits", nargs="+", default=None)
     parser.add_argument("--set", action="append", default=[], dest="overrides")
+    parser.add_argument("--holdout-index", type=int, default=None,
+                        help="Protocol B: cache holdout_b<i>'s splits into <dataset>_stage1_b<i>/cache")
     args = parser.parse_args()
-    run(args.dataset, splits=args.splits, overrides=args.overrides)
+    run(args.dataset, splits=args.splits, overrides=args.overrides,
+        holdout_index=args.holdout_index)
