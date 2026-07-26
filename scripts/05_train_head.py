@@ -58,8 +58,14 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     train_df = pd.read_parquet(processed_dir / "train_features.parquet")
     class_counts = train_df["canonical_label"].value_counts().to_dict()
 
-    train_source = _load_source(processed_dir, "train", cfg, feature_names, label_to_id)
-    val_source = _load_source(processed_dir, "val", cfg, feature_names, label_to_id)
+    # Reuse Stage-1 graph cache if it exists; otherwise build fresh.
+    cache_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_stage1" / "cache"
+    if not cache_dir.is_dir():
+        cache_dir = None  # fall back to building from scratch
+    else:
+        print(f"[05] Reusing Stage-1 graph cache: {cache_dir}")
+    train_source = _load_source(processed_dir, "train", cfg, feature_names, label_to_id, cache_dir)
+    val_source = _load_source(processed_dir, "val", cfg, feature_names, label_to_id, cache_dir)
 
     device = torch.device(cfg.run.device if torch.cuda.is_available() or cfg.run.device == "cpu" else "cpu")
     torch.manual_seed(cfg.run.seed)

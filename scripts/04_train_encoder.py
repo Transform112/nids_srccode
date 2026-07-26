@@ -24,13 +24,15 @@ from argus.config import load_config, resolved_path  # noqa: E402
 from argus.constants import DATASET_STATS, MIN_UNIQUE_SRC_IP  # noqa: E402
 from argus.graph.batching import AnchorBinGraphSource  # noqa: E402
 from argus.graph.builder import assign_node_ids, enforce_trap1_guard  # noqa: E402
+from argus.graph.cache import CachedGraphSource  # noqa: E402
 from argus.models.argus import ArgusModel  # noqa: E402
 from argus.train.checkpoint import save_checkpoint  # noqa: E402
 from argus.train.stage1_encoder import train_stage1  # noqa: E402
 
 
 def _load_source(processed_dir: Path, split: str, cfg, feature_names: list[str],
-                 label_to_id: dict[str, int] | None = None) -> AnchorBinGraphSource:
+                 label_to_id: dict[str, int] | None = None,
+                 cache_dir: Path | None = None) -> AnchorBinGraphSource | CachedGraphSource:
     import pandas as pd
 
     df = pd.read_parquet(processed_dir / f"{split}_features.parquet")
@@ -49,7 +51,7 @@ def _load_source(processed_dir: Path, split: str, cfg, feature_names: list[str],
     edge_features = df[feature_names].to_numpy(dtype=np.float32)
     label_ids = df["_label_id"].to_numpy()
 
-    return AnchorBinGraphSource(
+    source = AnchorBinGraphSource(
         times_ms, edge_features, src_ids, dst_ids, label_ids,
         anchor_bin_seconds=cfg.graph.anchor_bin_seconds,
         window_short_seconds=cfg.graph.window_short_seconds,
@@ -59,6 +61,10 @@ def _load_source(processed_dir: Path, split: str, cfg, feature_names: list[str],
         sampling=cfg.graph.sampling,
         strata=cfg.graph.strata,
     )
+    if cache_dir is not None:
+        split_cache = cache_dir / split
+        source = CachedGraphSource(source, cache_dir=split_cache, label=f"{split}")
+    return source
 
 
 def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None = None) -> Path:
@@ -85,6 +91,8 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     # Write class_vocab to run_dir (always writable, even on Kaggle read-only mounts).
     run_dir = Path(__file__).parents[1] / cfg.run.out_dir / f"{dataset}_stage1"
     run_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = run_dir / "cache"
+    print(f"[04] Graph cache dir: {cache_dir}")
     with open(run_dir / "class_vocab.json", "w") as f:
         json.dump(class_names, f, indent=2)
     # Also try artifact_dir (local dev); ignore if read-only (Kaggle).
@@ -95,8 +103,8 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     except OSError:
         pass  # Kaggle read-only mount — run_dir copy is canonical
 
-    train_source = _load_source(processed_dir, "train", cfg, feature_names, label_to_id)
-    val_source = _load_source(processed_dir, "val", cfg, feature_names, label_to_id)
+    train_source = _load_source(processed_dir, "train", cfg, feature_names, label_to_id, cache_dir)
+    val_source = _load_source(processed_dir, "val", cfg, feature_names, label_to_id, cache_dir)
 
     device = torch.device(cfg.run.device if torch.cuda.is_available() or cfg.run.device == "cpu" else "cpu")
     torch.manual_seed(cfg.run.seed)
@@ -110,6 +118,14 @@ def run(dataset: str, overrides: list[str] | None = None, max_bins: int | None =
     print(f"[04] Training Stage 1 on {device} ({len(class_names)} classes, F_e={f_e}) ...")
     result = train_stage1(model, train_source, val_source, cfg, device, max_bins=max_bins)
     print(f"[04] Stage 1 best val accuracy proxy: {result['best_val_acc']:.4f}")
+
+    # Log cache stats
+    for name, src in [("train", train_source), ("val", val_source)]:
+        if hasattr(src, 'stats'):
+            s = src.stats()
+            print(f"[04] Graph cache [{name}]: {s['cache_hits']} hits, "
+                  f"{s['cache_misses']} misses, "
+                  f"build={s['build_time_s']}s, load={s['load_time_s']}s")
 
     ckpt_path = run_dir / "stage1_final.pt"
     save_checkpoint(ckpt_path, model, torch.optim.AdamW(model.parameters()), epoch=len(result["history"]))
