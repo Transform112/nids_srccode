@@ -842,6 +842,67 @@ node (which triggers the trimming fallback), and a fully-connected node; plus
 gradient flow to inputs and `lambda_hat`, and no NaN when every node is
 isolated. Parameters are unchanged, so Stage-1 checkpoints remain compatible.
 
+**49. [CRITICAL, FIXED] Training walked the timeline in order, so every epoch ended on ~900 consecutive single-class steps — val accuracy exactly 0.0000**
+The first full Stage-1 run trained to `train_acc=0.75` and then scored
+**exactly 0.0000** validation accuracy across the first 1,700 val bins
+(~19K flows, 22% of them `benign`), rising only to 0.05 over the last 300.
+Exact zero over that many samples is not weak generalisation — random guessing
+across 15 classes is ~7%, and a constant `benign` predictor would score ~22%.
+
+**Root cause.** `run_epoch` iterated `source.unique_bins` in strict temporal
+order, and in CICIDS2018 each attack campaign occupies a contiguous block of
+time. Measured on the built cache:
+
+| slice of train timeline | class mix |
+|---|---|
+| first 20% | benign 31%, brute_ssh 19%, brute_ftp 17%, dos_slowhttptest 10% |
+| **last 10%** | **`bot` 100.0%** |
+
+So the final ~900 optimizer steps of every epoch saw exactly one class and the
+model finished each epoch as a near-constant `bot` predictor — textbook
+catastrophic forgetting. Every number in the log follows: val bins 0–1700 (where
+`bot` is rare) score 0 *by construction*; the val tail is 60% `bot` + 40%
+`infiltration`, which is the only region where such a model scores at all;
+`train_acc=0.75` looks healthy only because it is a running mean over the epoch,
+dominated by early bins from before the collapse; and epoch 1 opens at
+`loss=9.98`, the `bot`-specialised weights meeting benign traffic again.
+
+Ruled out first: label-vocabulary mismatch (val's derived vocab is identical to
+train's, and cached ids match the parquet distribution), empty batches, and the
+part-4 changes — this is orthogonal to the feature fixes and the vectorisation.
+
+Note this is a **pre-existing gap between design and implementation**, not a new
+regression: `cfg.train` already specifies `batch_anchor_bins=64`, `n_per_class`
+and `min_classes_per_batch` — i.e. class-balanced batches assembled across bins —
+but the loop was one-bin-at-a-time sequential, previously disclosed only as a
+*performance* deviation. On a time-sorted dataset it is a correctness bug.
+
+**Fix.** `run_epoch` now groups bins into contiguous BPTT chunks and, when
+training, visits those chunks in **random order** (`shuffle_chunks=True`).
+This is sound precisely because chunks are already independent units — memory
+is detached at every boundary, so no gradient ever crossed one. Bins stay in
+true temporal order *within* a chunk, so the TE6 recurrence and its BPTT window
+are unchanged; only the order in which windows are visited changes, exactly like
+shuffling minibatches in ordinary SGD. Memory is *cleared* (not just detached)
+at each shuffled boundary, since carrying node state backwards across a time
+jump would be meaningless — the standard convention when sampling random
+segments for truncated BPTT. Evaluation remains strictly sequential with
+continuous memory, so inference-time long-horizon context is untouched.
+
+Caveat: shuffling assumes node features come from the graph cache (built in one
+sequential pass, so `is_new_host` is already correct). Uncached training must
+pass `shuffle_chunks=False`.
+
+**Also worth recording:** G0 kept passing at 0.99 throughout, because it trains
+on a *class-balanced* 938-flow subset. A capacity gate that samples uniformly
+cannot see an ordering pathology — worth a future gate that checks final-weight
+accuracy rather than capacity alone.
+
+**Verified:** `tests/test_chunk_shuffle.py` — every bin visited exactly once,
+temporal order and contiguity preserved inside each chunk, the epoch's final
+chunk no longer pinned to the single-class tail, eval never shuffled, and memory
+not leaking across shuffled boundaries. Full suite: 118 passed.
+
 ---
 
 ## Decisions needed (updated after part 3)
