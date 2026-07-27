@@ -1116,17 +1116,72 @@ short of a campaign block: at `N = 16, bptt_chunk = 2` a segment is 32 bins
 (320 s, aligned with `window_long_seconds = 300`) against a `bot` block of
 ~930 bins.
 
-**Left at `N = 1` for the current run — deliberately.** The only configuration
-with real evidence behind it is `N = 1` (the 0.5361 epoch), and this run's
-change under test is the imbalance work. Changing two things at once would make
-the result unattributable. `N` is the first lever to pull if Stage-1's macro-F1
-disappoints.
+**Set to `N = 4` on evidence — see #55, which this turned out to be the fix
+for.** It was going to be left at 1 pending a controlled comparison; the G0
+investigation supplied one immediately and decisively.
 
 **Verified:** `tests/test_chunk_shuffle.py` grew 6 tests — every bin still
 visited once under grouping, segments contiguous and time-ordered, the memory
 span demonstrably longer at `N = 4` than `N = 1`, `N = 1` bit-identical to the
 ungrouped path, the single-class tail still broken up, and grouping ignored
 when not shuffling.
+
+---
+
+## #55 The G0 regression was `bptt_chunk`, and the fix costs nothing
+
+G0 failed twice more after the #54 fix, at **exactly 0.9360** both times — best
+of 150 epochs, reached at epoch 48 and never beaten. A hard plateau, perfectly
+reproducible, so #54's "noisy last epoch" was real but not the cause.
+
+**The baseline was misread.** The number worth reproducing is Stage-1 v3's
+**0.9915 on 938 flows**. The 0.9947 quoted throughout the earlier sessions came
+from the *validation* kernel's smaller **378-flow** subset — a different
+measurement. And v4/v5 never ran G0 at all: the kernel attaches its own prior
+output for resume, and `_gate0_preflight` is skipped when `resume=True`. So G0
+had not genuinely run since v3, and the suspect window was much wider than it
+looked.
+
+**Three candidates eliminated, each with a test rather than an argument:**
+
+| Candidate | How it was ruled out |
+|---|---|
+| Layer vectorisation (#48) | The 9 equivalence tests only compared *forward* output; the one gradient test asserted finiteness, never equality. Added gradient-equivalence against the reference loop for inputs and every parameter, across 3 aggregators × te4 on/off, plus a check that no `finfo.max` sentinel leaks into the gradient. All match. |
+| Chunk shuffling (#49) | Real preflight both ways, same seed: 0.9158 sequential vs 0.9296 shuffled. Shuffling is *better*. |
+| Imbalance refactor (#50–#53) | `test_default_loss_matches_the_pre_refactor_formulation`: identical loss value (`rel=1e-6`) and identical gradient (`atol=1e-7`) at default settings. |
+
+**Actual cause: `bptt_chunk` 8 → 2**, the OOM workaround from #48 — which was
+disclosed as a deviation but never measured for accuracy cost. On the real G0
+subset, 60 epochs, identical seed:
+
+| config | memory span | gradient horizon | best train acc |
+|---|---:|---:|---:|
+| `bptt_chunk=8` | 8 bins | 8 bins | 0.9808 |
+| `bptt_chunk=2` | 2 bins | 2 bins | **0.9296** |
+| `bptt_chunk=2, shuffle_group_chunks=4` | 8 bins | 2 bins | **1.0000** (hit 0.99 at epoch 38) |
+
+**It was the memory span, not the gradient horizon.** Holding the span at 8
+bins while truncating backward at 2 not only recovers the loss — it beats the
+`bptt_chunk=8` baseline and reaches 0.99 faster than v3 did (epoch 38 vs 66).
+
+This matters beyond G0. Only the *gradient* horizon has to shrink to fit the
+T4: backward is truncated per chunk, but memory is cleared per *segment*, so
+the TE6 span costs nothing to keep. Dropping `bptt_chunk` alone silently
+shortened it, which is why the deviation was more expensive than "one
+optimiser step per 2 bins instead of 8" suggested — the per-node GRU was being
+trained on 20-second histories.
+
+**Invariant, now stated in `config/default.yaml` and in the Kaggle kernel:**
+
+    bptt_chunk * shuffle_group_chunks == 8   # the documented T_bptt
+
+Lower `bptt_chunk` to fit memory, raise `shuffle_group_chunks` by the same
+factor. `T_bptt = 8` is no longer a disclosed deviation for the memory span —
+only for the gradient horizon.
+
+`shuffle_group_chunks=8` (span 16) tracks *slower* than 4 at equal epochs
+(0.5512 vs 0.6930 at epoch 20), so longer is not monotonically better; span 8,
+the documented value, is the right setting rather than a lucky one.
 
 ---
 

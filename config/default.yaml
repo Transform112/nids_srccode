@@ -139,8 +139,13 @@ train:
   # Consecutive BPTT chunks kept together as one shuffled segment. Shuffling
   # (docs/BUGS.md #49) clears TE6 memory at every segment boundary, so at 1 a
   # node's memory never spans more than `bptt_chunk` bins in training while
-  # eval accumulates it over the whole split. Raising this restores the span
-  # at no memory cost — gradient is still truncated every `bptt_chunk` bins.
+  # eval accumulates it over the whole split.
+  #
+  # INVARIANT: bptt_chunk * shuffle_group_chunks == 8 (the documented T_bptt).
+  # If you lower `bptt_chunk` to fit GPU memory, raise this by the same factor.
+  # Only the gradient horizon has to shrink — backward is truncated per chunk,
+  # memory is cleared per segment, so the span costs nothing to keep. Measured
+  # on the G0 subset: span 8 scores 1.0000, span 2 scores 0.9296 (BUGS.md #55).
   shuffle_group_chunks: 1
   warmup_epochs: 3
   grad_clip: 1.0
