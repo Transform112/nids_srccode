@@ -123,6 +123,55 @@ def test_batched_matches_loop(aggregation, te4_enabled):
     torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.parametrize("aggregation", ["trimmed", "mean", "soft_medoid"])
+@pytest.mark.parametrize("te4_enabled", [True, False])
+def test_batched_gradients_match_the_loop(aggregation, te4_enabled):
+    """Equal forward output is not enough. The batched path reaches the same
+    numbers through `masked_fill` sentinels, a shared `argsort`, and `gather` —
+    any of which could route gradient differently while the forward value
+    matches, degrading training silently. G0 dropped 0.9915 -> 0.9360 across
+    the window that contains this rewrite, so the backward pass needs the same
+    equivalence check the forward already had (docs/BUGS.md #48, #54).
+    """
+    layer = _make_layer(aggregation=aggregation, te4_enabled=te4_enabled)
+    x, na, ndt, te, mask = _make_inputs()
+
+    def grads(fn):
+        layer.zero_grad(set_to_none=True)
+        xg = x.clone().requires_grad_(True)
+        nag = na.clone().requires_grad_(True)
+        fn(xg, nag).pow(2).sum().backward()
+        return (xg.grad, nag.grad,
+                {n: (p.grad.clone() if p.grad is not None else None)
+                 for n, p in layer.named_parameters()})
+
+    gx_b, gna_b, gp_b = grads(lambda a, b: layer(a, b, ndt, te, mask))
+    gx_r, gna_r, gp_r = grads(lambda a, b: _reference_forward(layer, a, b, ndt, te, mask))
+
+    torch.testing.assert_close(gx_b, gx_r, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(gna_b, gna_r, rtol=1e-4, atol=1e-5)
+    for name in gp_r:
+        if gp_r[name] is None and gp_b[name] is None:
+            continue
+        assert (gp_b[name] is None) == (gp_r[name] is None), f"{name}: gradient presence differs"
+        torch.testing.assert_close(gp_b[name], gp_r[name], rtol=1e-4, atol=1e-5,
+                                   msg=lambda m, n=name: f"param {n}: {m}")
+
+
+def test_no_masked_sentinel_leaks_into_gradients():
+    """`_sorted_keep` pads masked slots with `finfo.max` before sorting. If a
+    padded slot were ever kept, the forward would blow up — but a subtler
+    failure is a finite forward with an enormous or NaN gradient."""
+    layer = _make_layer()
+    x, na, ndt, te, mask = _make_inputs()
+    na = na.clone().requires_grad_(True)
+    layer(x, na, ndt, te, mask).pow(2).sum().backward()
+    assert torch.isfinite(na.grad).all()
+    assert float(na.grad.abs().max()) < 1e4, "sentinel-scale magnitude leaked into the gradient"
+    # Masked slots contribute nothing, so their gradient must be exactly zero.
+    assert float(na.grad[~mask].abs().max()) == 0.0
+
+
 def test_isolated_node_row_is_untouched_residual():
     """A node with no neighbours must aggregate to exactly zero, as the loop's
     `continue` left `out[v]` at its zero initialisation."""
